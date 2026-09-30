@@ -1,0 +1,12 @@
+# 运行时状态：窗口位置、折叠状态
+window.json
+
+# 本地配置（覆盖默认轮询参数等）
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 测试用的临时库目录
+.tmp-test/

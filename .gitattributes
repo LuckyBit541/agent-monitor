@@ -1,0 +1,11 @@
+# .bat 必须保持 CRLF：改成 LF 后 cmd 解析中文/长行会出现各种诡异问题
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 其余文本按 LF 入库
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# 二进制
+*.png binary
