@@ -154,13 +154,17 @@ python cursor_float.py --watch --signals
 ## 命令行
 
 ```powershell
-python cursor_float.py --once              # 打印一次快照
-python cursor_float.py --watch --signals   # 终端滚动输出，并显示判定信号明细
+python cursor_float.py --once              # 打印一次快照（默认观察最多 4 秒）
+python cursor_float.py --watch --signals   # 终端滚动输出，并显示判定依据明细
 python cursor_float.py --json              # JSON 输出，便于接别的工具
 python cursor_float.py --demo              # 假数据渲染窗口
 ```
 
-`--watch --signals` 是把「为什么这个会话被判定为运行中」打出来，排查误判时最有用。
+**`--once` 默认会观察最多 4 秒**，因为判定依赖「内容较上一轮有变化」，只查一轮会把
+正在跑的会话漏掉（这一点踩过坑：同一个库，浮窗显示有会话在跑，`--once` 却报空）。
+`--settle 0` 只看一轮，`--settle 10` 多等一会儿。
+
+`--watch --signals` 会逐个列出每个会话的判定依据，排查「为什么没显示」时最有用。
 
 ## 测试
 

@@ -1083,7 +1083,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--once", action="store_true", help="打印一次快照后退出")
     ap.add_argument("--watch", action="store_true", help="终端持续输出")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
-    ap.add_argument("--signals", action="store_true", help="显示判定信号明细")
+    ap.add_argument("--signals", action="store_true", help="显示判定依据明细")
+    ap.add_argument("--settle", type=float, default=4.0,
+                    help="--once 最多观察这么多秒再下结论：判定依赖内容变化，"
+                         "只查一轮可能误报为空（0 表示只查一轮）")
     ap.add_argument("--demo", action="store_true", help="用假数据渲染窗口（调试 UI）")
     args = ap.parse_args(argv)
 
@@ -1101,24 +1104,51 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     if args.once or args.watch or args.json:
+        interval = max(0.2, float(cfg["interval_ms"]) / 1000.0)
         try:
+            settle = max(0.0, float(args.settle)) if not args.watch else 0.0
+            deadline = time.time() + settle
+            rounds = 0
             while True:
+                rounds += 1
                 try:
                     snaps = reader.snapshot(cfg)
                     err = ""
                 except Exception as exc:                   # noqa: BLE001
                     snaps, err = [], f"{type(exc).__name__}: {exc}"
-                if args.json:
-                    print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
-                                      "probe": reader.last_probe,
-                                      "error": err}, ensure_ascii=False))
-                else:
-                    out = render_text(snaps, err,
-                                      reader.last_probe if args.signals else None)
-                    print(out, flush=True)
-                if not args.watch:
+                # 判定依赖「内容较上一轮有变化」，所以只看一轮可能误报为空。
+                # --once 时给一点观察时间，等不到再下结论。
+                if args.watch or snaps or time.time() >= deadline:
                     break
-                time.sleep(max(0.2, float(cfg["interval_ms"]) / 1000.0))
+                time.sleep(interval)
+            if args.json:
+                print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
+                                  "probe": reader.last_probe,
+                                  "rounds": rounds,
+                                  "error": err}, ensure_ascii=False))
+            else:
+                out = render_text(snaps, err,
+                                  reader.last_probe if args.signals else None)
+                if rounds > 1:
+                    out += (f"\n  （观察了 {rounds} 轮 / {settle:g} 秒；"
+                            f"判定依赖内容变化，单轮可能看不到正在跑的会话）")
+                print(out, flush=True)
+            if args.watch:
+                while True:
+                    time.sleep(interval)
+                    try:
+                        snaps = reader.snapshot(cfg)
+                        err = ""
+                    except Exception as exc:               # noqa: BLE001
+                        snaps, err = [], f"{type(exc).__name__}: {exc}"
+                    if args.json:
+                        print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
+                                          "probe": reader.last_probe,
+                                          "error": err}, ensure_ascii=False))
+                    else:
+                        print(render_text(snaps, err,
+                                          reader.last_probe if args.signals else None),
+                              flush=True)
         except KeyboardInterrupt:
             pass
         return 0
