@@ -516,6 +516,14 @@ class CardWindow(QWebEngineView):
         if DEBUG:
             LOG.info("收起: 原=%s -> 细条=(%s,%s) side=%s", self._expanded, hx, hy, self.side)
 
+    def hold_folded(self) -> None:
+        """收起并停掉鼠标轮询——仅供截图使用。
+
+        否则鼠标只要经过边缘就会把细条撬开，截出来的就不是收起状态了。
+        """
+        self.fold()
+        self._mouse_timer.stop()
+
     def unfold(self) -> None:
         """从细条展开回卡片。"""
         if not self.folded:
@@ -704,8 +712,8 @@ def main() -> None:
     if state.get("dock"):
         view.apply_dock(True)
     if args.fold:
-        # 截图用：不等鼠标走开，直接收起
-        QTimer.singleShot(1200, view.fold)
+        # 截图用：不等鼠标走开，直接收起并锁住
+        QTimer.singleShot(1200, view.hold_folded)
     if args.shot:
         QTimer.singleShot(6000, lambda: _capture(args.shot, view))
     if args.selftest:
