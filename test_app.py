@@ -68,12 +68,17 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(state["mode"], "detail")
         self.assertEqual(state["opacity"], 1.0)
         self.assertEqual(state["collapsed"], [])
+        self.assertFalse(state["dock"])
 
     def test_round_trip(self):
         original = {"mode": "mini", "opacity": 0.4, "pinned": False,
-                    "collapsed": ["a"], "x": 10, "y": 20}
+                    "collapsed": ["a"], "dock": True, "x": 10, "y": 20}
         self.assertTrue(ws.save_state(original, self.path))
         self.assertEqual(ws.load_state(self.path), original)
+
+    def test_dock_defaults_to_false_when_absent(self):
+        self.path.write_text('{"mode": "detail"}', encoding="utf-8")
+        self.assertFalse(ws.load_state(self.path)["dock"])
 
     def test_corrupt_file_gives_defaults(self):
         self.path.write_text("{ not json", encoding="utf-8")
@@ -123,6 +128,43 @@ class PositionTest(unittest.TestCase):
     def test_bad_coordinates_fall_back(self):
         x, y = ws.initial_position({"x": "abc", "y": None}, self.AREA, 400)
         self.assertEqual(x, 1920 - 400 - 28)
+
+
+class DockingTest(unittest.TestCase):
+    AREA = (0, 0, 1920, 1080)
+
+    def test_side_is_the_nearer_edge(self):
+        self.assertEqual(ws.dock_side(self.AREA, 1492, 400), "right")
+        self.assertEqual(ws.dock_side(self.AREA, 20, 400), "left")
+        # 窗口中心正好在中线（960）左侧 -> 贴左；跨过中线 -> 贴右
+        self.assertEqual(ws.dock_side(self.AREA, 700, 400), "left")
+        self.assertEqual(ws.dock_side(self.AREA, 800, 400), "right")
+
+    def test_folded_sticks_to_the_edge_and_keeps_vertical_center(self):
+        x, y = ws.folded_geometry(self.AREA, 1492, 300, 400, 144)
+        self.assertEqual(x, 1920 - ws.HANDLE_W)
+        self.assertEqual(y, 300 + 144 // 2 - ws.HANDLE_H // 2)
+
+    def test_folded_on_left_edge(self):
+        x, _y = ws.folded_geometry(self.AREA, 20, 300, 400, 144)
+        self.assertEqual(x, 0)
+
+    def test_folded_stays_inside_screen_vertically(self):
+        _x, y = ws.folded_geometry(self.AREA, 1492, 1050, 400, 144)
+        self.assertLessEqual(y + ws.HANDLE_H, 1080)
+        _x, y2 = ws.folded_geometry(self.AREA, 1492, -50, 400, 144)
+        self.assertGreaterEqual(y2, 0)
+
+    def test_expanded_returns_to_the_edge_it_was_folded_to(self):
+        # 在右边缘收起（细条贴右边），展开后右边缘仍要对齐
+        x, _y = ws.expanded_geometry(self.AREA, 1920 - ws.HANDLE_W, 300, 400, 144)
+        self.assertEqual(x, 1920 - 400)
+
+    def test_expanded_stays_inside_screen_vertically(self):
+        _x, y = ws.expanded_geometry(self.AREA, 1900, 1000, 400, 400)
+        self.assertLessEqual(y + 400, 1080)
+        _x, y2 = ws.expanded_geometry(self.AREA, 1900, 0, 400, 400)
+        self.assertGreaterEqual(y2, 0)
 
 
 class GroupingTest(unittest.TestCase):

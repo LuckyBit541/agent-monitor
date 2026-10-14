@@ -18,17 +18,24 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from sessions import CursorReader, load_config
 from window_state import (
+    HANDLE_H,
+    HANDLE_W,
     MAX_HEIGHT,
     MIN_HEIGHT,
     MODES,
     STATE_PATH,
     WIDTHS,
+    dock_side,
+    demo_sessions,
+    expanded_geometry,
+    folded_geometry,
     group_sessions,
     initial_position,
     load_state,
@@ -80,6 +87,12 @@ except ImportError:                                   # pragma: no cover
 WINDOW_TITLE = "Cursor 运行中会话"
 DEBUG = bool(os.environ.get("CURSOR_FLOAT_DEBUG"))
 
+# 贴边自动收起：鼠标离开多久后收起、多久轮询一次鼠标位置、
+# 以及收起后判定「鼠标靠近」的额外容差。
+FOLD_DELAY_MS = 700
+MOUSE_POLL_MS = 120
+HOT_PAD = 10
+
 # 首帧的估算高度，页面测出真实值后会立刻纠正
 WINDOW_HEIGHT = 200
 
@@ -91,6 +104,8 @@ PAGE_CALLS = (
     "set_mode",
     "set_opacity",
     "set_pinned",
+    "set_dock",
+    "expand_now",
     "toggle_group",
     "expand_all",
     "collapse_all",
@@ -116,10 +131,11 @@ class Bridge(QObject):
     reply = Signal(int, str)
     pushed = Signal(str)
 
-    def __init__(self, state: dict, cfg: dict) -> None:
+    def __init__(self, state: dict, cfg: dict, demo: bool = False) -> None:
         super().__init__()
         self._state = state
         self._cfg = cfg
+        self._demo = demo
         self._view: CardWindow | None = None
         self._reader = CursorReader()
         # 轮询线程和 refresh 调用都会用 reader，而 reader 内部的指纹是有状态的，
@@ -170,6 +186,9 @@ class Bridge(QObject):
             "mode": normalize_mode(self._state.get("mode")),
             "opacity": normalize_opacity(self._state.get("opacity", 1)),
             "pinned": bool(self._state.get("pinned", True)),
+            "dock": bool(self._state.get("dock", False)),
+            "folded": bool(self._view is not None and self._view.folded),
+            "side": (self._view.side if self._view is not None else "right"),
         }
 
     def _store(self, **changes: Any) -> dict:
@@ -185,11 +204,14 @@ class Bridge(QObject):
     def _collect(self) -> dict:
         """读一次会话状态，整理成页面需要的结构。"""
         error = ""
-        try:
-            with self._lock:
-                sessions = self._reader.snapshot(self._cfg)
-        except Exception as exc:                       # noqa: BLE001
-            sessions, error = [], f"{type(exc).__name__}: {exc}"
+        if self._demo:
+            sessions = demo_sessions()
+        else:
+            try:
+                with self._lock:
+                    sessions = self._reader.snapshot(self._cfg)
+            except Exception as exc:                   # noqa: BLE001
+                sessions, error = [], f"{type(exc).__name__}: {exc}"
         collapsed = self._collapsed()
         self._last_signature = signature(sessions, collapsed, error)
         self._last_error = error
@@ -232,6 +254,30 @@ class Bridge(QObject):
             self._view.set_on_top(settings["pinned"])
         return settings
 
+    def set_dock(self, dock: bool) -> dict:
+        """开关「贴边自动收起」。打开时立即吸附到最近的那条竖边。"""
+        settings = self._store(dock=bool(dock))
+        if self._view is not None:
+            self._view.apply_dock(settings["dock"])
+        self.pushed.emit(json.dumps(self._collect(), ensure_ascii=False))
+        return settings
+
+    def notify_fold(self) -> None:
+        """收起/展开后立刻让页面切到对应的外观，不等下一次轮询。"""
+        try:
+            self.pushed.emit(json.dumps(self._collect(), ensure_ascii=False))
+        except Exception as exc:                       # noqa: BLE001
+            LOG.warning("推送收起状态失败: %s", exc)
+
+    def expand_now(self) -> bool:
+        """点击收起后的细杆：立刻展开，并把「靠近才展开」重新武装起来。"""
+        if self._view is None:
+            return False
+        self._view.unfold()
+        self._view._armed = False
+        self._view._left_at = None
+        return True
+
     def toggle_group(self, project: str) -> dict:
         collapsed = self._collapsed()
         name = str(project)
@@ -256,6 +302,8 @@ class Bridge(QObject):
         return self._settings()
 
     def _reader_sessions(self) -> list:
+        if self._demo:
+            return demo_sessions()
         try:
             with self._lock:
                 return self._reader.snapshot(self._cfg)
@@ -371,6 +419,11 @@ class CardWindow(QWebEngineView):
         self._bridge = bridge
         self._ready = False
         self._width = WIDTHS[normalize_mode(bridge._state.get("mode"))]
+        self.folded = False                 # 是否已收起成细条
+        self.side = "right"                 # 吸附在哪条竖边
+        self._expanded: tuple[int, int, int, int] | None = None
+        self._left_at: float | None = None
+        self._armed = False                 # 收起后需先离开热区，才允许再次展开
         state = bridge._state
 
         self.setWindowTitle(WINDOW_TITLE)
@@ -391,28 +444,124 @@ class CardWindow(QWebEngineView):
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
-        self._save_timer.timeout.connect(self._save_position)
+        self._save_timer.timeout.connect(self._on_move_settled)
 
         x, y = initial_position(state, _screen_area(*saved_corner(state)), self._width)
         if DEBUG:
-            LOG.info("初始位置=%s,%s 模式=%s", x, y, state.get("mode"))
+            LOG.info("初始位置=%s,%s 模式=%s 贴边=%s", x, y, state.get("mode"),
+                     state.get("dock"))
         self.setGeometry(x, y, self._width, WINDOW_HEIGHT)
         self.load(QUrl.fromLocalFile(str(CARD_PATH)))
         self._ready = True
 
+        # 用轮询鼠标位置判断进出，而不是靠 enter/leave 事件：卡片是半透明窗口，
+        # 圆角之外那些像素不接收事件，事件方式会漏判。
+        self._mouse_timer = QTimer(self)
+        self._mouse_timer.setInterval(MOUSE_POLL_MS)
+        self._mouse_timer.timeout.connect(self._track_mouse)
+        self._mouse_timer.start()
+
+    # ---------------------------------------------------------- 贴边自动收起
+
+    def _area(self) -> tuple[int, int, int, int]:
+        return _screen_area(self.x(), self.y())
+
+    def apply_dock(self, dock: bool) -> None:
+        """开关贴边：打开就吸附到最近的竖边，关闭就恢复成展开状态。"""
+        if not dock:
+            if self.folded:
+                self.unfold()
+            return
+        self.side = dock_side(self._area(), self.x(), self.width())
+        self._snap_to_edge()
+        self._left_at = None
+
+    def _snap_to_edge(self) -> None:
+        if self.folded:
+            return
+        area = self._area()
+        x = area[0] if self.side == "left" else area[2] - self.width()
+        y = max(area[1], min(self.y(), area[3] - self.height() - 4))
+        if (x, y) != (self.x(), self.y()):
+            if DEBUG:
+                LOG.info("吸附: (%s,%s) -> (%s,%s) side=%s", self.x(), self.y(), x, y,
+                         self.side)
+            self.move(x, y)
+
+    def fold(self) -> None:
+        """收起成贴边的细条。"""
+        if self.folded:
+            return
+        area = self._area()
+        self.side = dock_side(area, self.x(), self.width())
+        self._expanded = (self.x(), self.y(), self.width(), self.height())
+        hx, hy = folded_geometry(area, *self._expanded)
+        self.folded = True
+        self.setGeometry(hx, hy, HANDLE_W, HANDLE_H)
+        self._left_at = None
+        self._armed = False
+        self._bridge.notify_fold()
+        if DEBUG:
+            LOG.info("收起: 原=%s -> 细条=(%s,%s) side=%s", self._expanded, hx, hy, self.side)
+
+    def unfold(self) -> None:
+        """从细条展开回卡片。"""
+        if not self.folded:
+            return
+        source = self._expanded or (self.x(), self.y(), self._width, 260)
+        ex, ey = expanded_geometry(self._area(), self.x(), self.y(), source[2], source[3])
+        self.folded = False
+        self._width = source[2]
+        self.setGeometry(ex, ey, source[2], source[3])
+        self._bridge.notify_fold()
+        if DEBUG:
+            LOG.info("展开: 细条=(%s,%s) -> (%s,%s) %sx%s", self.x(), self.y(), ex, ey,
+                     source[2], source[3])
+
+    def _track_mouse(self) -> None:
+        if not self._ready or not self._bridge._state.get("dock"):
+            return
+        from PySide6.QtGui import QCursor
+
+        pos = QCursor.pos()
+        rect = self.frameGeometry()
+        if self.folded:
+            hot = rect.adjusted(-HOT_PAD, -HOT_PAD, HOT_PAD, HOT_PAD)
+            if not hot.contains(pos):
+                self._armed = True          # 鼠标离开过，下次靠近才展开
+            elif self._armed:
+                self._armed = False
+                self.unfold()
+            return
+
+        if rect.contains(pos):
+            self._left_at = None
+            return
+        now = time.monotonic()
+        if self._left_at is None:
+            self._left_at = now
+        elif (now - self._left_at) * 1000 >= FOLD_DELAY_MS:
+            self.fold()
+
     def fit_size(self, width: int, height: int) -> None:
         """按卡片上报的尺寸调整窗口，并保证窗口整体留在屏幕内。"""
+        if self.folded:
+            return                    # 收起时尺寸由 fold 决定，页面不要插话
         self._width = max(120, min(760, width))
-        _left, top, right, bottom = _screen_area(self.x(), self.y())
+        _left, top, right, bottom = self._area()
         room = bottom - self.y() - 8
         target = max(MIN_HEIGHT, min(MAX_HEIGHT, height, max(MIN_HEIGHT, room)))
         if target != self.height() or self._width != self.width():
+            if DEBUG:
+                LOG.info("适配: 上报=%sx%s -> %sx%s", width, height, self._width, target)
             self.resize(self._width, target)
         # 高度变了可能把底边推出屏幕，重新夹一次
         x = max(_left, min(self.x(), right - self._width))
         y = max(top, min(self.y(), bottom - target - 4))
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
+        if self._bridge._state.get("dock"):
+            self._snap_to_edge()
 
     def set_on_top(self, pinned: bool) -> None:
         # QWindow.setFlag 原地更新原生窗口；QWidget 的等价操作会重建窗口，
@@ -426,14 +575,27 @@ class CardWindow(QWebEngineView):
         if self._ready:
             self._save_timer.start()
 
+    def _on_move_settled(self) -> None:
+        """拖动停下后：贴边模式下吸回最近的竖边，并记住位置。"""
+        if self._bridge._state.get("dock") and not self.folded:
+            self.side = dock_side(self._area(), self.x(), self.width())
+            self._snap_to_edge()
+        self._save_position()
+
     def closeEvent(self, event) -> None:               # noqa: N802 - Qt 覆写
         self._save_timer.stop()
+        self._mouse_timer.stop()
         self._save_position()
         self._bridge._shutdown()
         super().closeEvent(event)
 
     def _save_position(self) -> None:
-        self._bridge._store(x=self.x(), y=self.y())
+        # 收起时记录展开状态的位置，下次启动才不会以细条的位置为准
+        if self.folded and self._expanded:
+            x, y = self._expanded[0], self._expanded[1]
+        else:
+            x, y = self.x(), self.y()
+        self._bridge._store(x=x, y=y)
 
 
 def _capture(path: str, view: CardWindow) -> None:
@@ -464,6 +626,8 @@ SELFTEST_JS = """
   out.alpha = getComputedStyle(document.documentElement).getPropertyValue('--bg-alpha').trim();
   document.getElementById('btnPin').click();
   out.pinActive = document.getElementById('btnPin').classList.contains('on');
+  out.hasDockButton = Boolean(document.getElementById('btnDock'));
+  out.hasHandle = Boolean(document.getElementById('handle'));
   const head = document.querySelector('.ghead');
   out.hasGroups = Boolean(head);
   if (head) { head.click(); out.afterGroupClick = document.querySelector('.ghead').className; }
@@ -488,7 +652,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="悬浮显示 Cursor 中正在运行的会话")
     parser.add_argument("--shot", help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--fold", action="store_true",
+                        help=argparse.SUPPRESS)          # 截图用：直接以收起状态启动
     parser.add_argument("--mode", choices=MODES, help="以指定模式启动（会被写入状态）")
+    parser.add_argument("--demo", action="store_true",
+                        help="用编造的会话数据渲染（截图 / 看外观用）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="[cursor-float] %(message)s")
@@ -500,11 +668,16 @@ def main() -> None:
     cfg = load_config()
     if DEBUG:
         LOG.info("状态文件=%s 状态=%s 配置=%s", STATE_PATH, state, cfg)
-    bridge = Bridge(state, cfg)
+    bridge = Bridge(state, cfg, demo=args.demo)
     view = CardWindow(bridge)
     bridge._view = view
     bridge.start_worker()
     view.show()
+    if state.get("dock"):
+        view.apply_dock(True)
+    if args.fold:
+        # 截图用：不等鼠标走开，直接收起
+        QTimer.singleShot(1200, view.fold)
     if args.shot:
         QTimer.singleShot(6000, lambda: _capture(args.shot, view))
     if args.selftest:
