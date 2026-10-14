@@ -1,4 +1,5 @@
-# 运行时状态：窗口位置、折叠状态
+# 运行时状态：窗口位置、显示模式、透明度、折叠状态
+# （实际写在 %USERPROFILE%\.cursor-float\window.json，这里兜底防止误提交）
 window.json
 
 # 本地配置（覆盖默认轮询参数等）
@@ -8,5 +9,12 @@ config.json
 __pycache__/
 *.py[cod]
 
-# 测试用的临时库目录
+# 测试用的临时目录
 .tmp-test/
+
+# tools/capture.py 单张截图；合成结果 _preview.png 是仓库的一部分，要提交
+_shots/
+
+# --shot 调试截图
+_shot_*.png
+*.log

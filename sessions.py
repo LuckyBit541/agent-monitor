@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-cursor-float —— 悬浮窗显示 Cursor 中「正在运行」的 Agent 会话及当前动作。
+r"""
+cursor-float 的数据层：只读读取 Cursor 的 state.vscdb，判定哪些会话正在运行。
 
 数据来源（全部只读，不写入 Cursor 任何文件）：
-  %APPDATA%\\Cursor\\User\\globalStorage\\state.vscdb
+  %APPDATA%\Cursor\User\globalStorage\state.vscdb
     - composerHeaders                    每个会话一行（标题/工作区/最后活动/是否归档/子代理）
-    - cursorDiskKV['composerData:<id>']   会话实时状态（status / generatingBubbleIds / 待办）
+    - cursorDiskKV['composerData:<id>']   会话内容，用于「有没有在变」的判定与当前动作
     - cursorDiskKV['bubbleId:<id>:<bid>'] 最近一条气泡，toolFormerData 给出「当前在跑什么工具」
 
-运行：
-    python cursor_float.py                # 打开悬浮窗
-    python cursor_float.py --watch        # 终端滚动输出（调试用）
-    python cursor_float.py --once         # 打印一次快照后退出
-    python cursor_float.py --json         # 输出 JSON 快照
+判定依据见 CursorReader._classify 的注释：落盘的 status / generatingBubbleIds 在生成期间
+并不刷新，唯一可靠的是 composerData 的内容在变化，以及工具 status == "loading"。
+
+也可以直接当命令行工具用：
+    python sessions.py --once              # 打印一次快照
+    python sessions.py --watch --signals   # 滚动输出，并解释每个会话的判定依据
+    python sessions.py --json              # JSON 输出
 """
 
 from __future__ import annotations
@@ -23,9 +25,7 @@ import json
 import os
 import sqlite3
 import sys
-import threading
 import time
-import queue
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -36,36 +36,18 @@ from typing import Any, Optional
 
 DEFAULTS: dict[str, Any] = {
     "interval_ms": 900,        # 轮询间隔
-    "grace_seconds": 25,       # 最后一次活动在该秒数内仍视为「运行中」，用于衔接工具调用之间的空档
+    "grace_seconds": 25,       # 头部时间戳在此秒数内仍视为运行中，用于回合刚开始的时刻
     "header_scan": 60,         # 读取最近多少条 composerHeaders
     "live_scan": 8,            # 无论时间戳如何，都强制检查的最靠前会话数（兜底）
     "first_scan": 12,          # 启动后第一轮最多检查多少个会话（避免首屏卡顿）
     "candidate_window_sec": 900,  # 头部时间戳在这个窗口内的会话才去解析状态对象
     "track_keep_sec": 600,     # 曾经活跃过的会话，继续检查多久
     "activity_grace_sec": 45,  # 观察到内容变化后，还视为「运行中」多久
-    "max_rows": 8,             # 窗口最多显示几条会话
-    "width": 400,              # 窗口宽度
-    "alpha": 0.96,             # 窗口不透明度
-    "topmost": True,           # 置顶
-    "rounded": True,           # 圆角
+    "max_rows": 8,             # 最多显示几条会话
 }
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
-STATE_PATH = SCRIPT_DIR / "window.json"
-
-# 颜色
-CARD_BG = "#1b1d21"
-BORDER = "#31353c"
-TXT = "#e7e9ec"
-TXT_DIM = "#9aa1ab"
-TXT_FAINT = "#71787f"
-GREEN = "#3ecf72"
-AMBER = "#e5a53a"
-BLUE = "#4c9aff"
-KEY_COLOR = "#010203"          # 透明色键，勿用于任何可见控件
-
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # 工具名 -> (中文动作, 参数里取哪个字段作为详情)
 TOOL_MAP: dict[str, tuple[str, str]] = {
@@ -603,581 +585,72 @@ def session_to_dict(s: Session) -> dict[str, Any]:
         "signals": s.signals,
     }
 
-
 # --------------------------------------------------------------------------
-# 悬浮窗
+# 命令行（排查用：解释每个会话为什么显示 / 为什么不显示）
 # --------------------------------------------------------------------------
-
-class FloatWindow:
-    def __init__(self, cfg: dict[str, Any], reader: CursorReader, poll: bool = True) -> None:
-        import tkinter as tk
-        self.tk = tk
-        self.cfg = cfg
-        self.reader = reader
-        self.sessions: list[Session] = []
-        self.error = ""
-        self.spin = 0
-        self.poll = poll
-        self.collapsed: set[str] = set()      # 被折叠的项目名
-        self.q: queue.Queue = queue.Queue()
-        self._drag = None
-        self._alive = True
-
-        self.root = tk.Tk()
-        self.root.title("Cursor 运行中会话")
-        self.root.overrideredirect(True)
-        self._apply_window_flags()
-        self.root.configure(bg=KEY_COLOR)
-
-        self.radius = 14 if cfg.get("rounded", True) else 0
-        self.canvas = tk.Canvas(self.root, bg=KEY_COLOR, highlightthickness=0, bd=0)
-        self.canvas.pack(fill="both", expand=True)
-        self._bg_id = None
-
-        pad = self.radius
-        self.body = tk.Frame(self.root, bg=CARD_BG)
-        self.body.place(x=pad, y=pad)
-
-        self._build_header()
-        self._list = tk.Frame(self.body, bg=CARD_BG)
-        self._list.pack(fill="x", padx=10, pady=(2, 10))
-
-        self._bind_drag(self.root)
-        self._bind_drag(self.canvas)
-
-        self._restore_geometry()
-        self.root.bind("<Configure>", self._redraw_bg)
-
-        if self.poll:
-            self._start_poller()
-            self.root.after(60, self._drain)
-        self.root.after(120, self._tick_spinner)
-        self.root.protocol("WM_DELETE_WINDOW", self.quit)
-
-    # -- 窗口外框 -----------------------------------------------------------
-    def _apply_window_flags(self) -> None:
-        try:
-            self.root.attributes("-topmost", bool(self.cfg.get("topmost", True)))
-        except Exception:
-            pass
-        try:
-            self.root.attributes("-alpha", float(self.cfg.get("alpha", 0.96)))
-        except Exception:
-            pass
-        if self.cfg.get("rounded", True):
-            try:
-                self.root.attributes("-transparentcolor", KEY_COLOR)
-            except Exception:
-                pass
-
-    def _build_header(self) -> None:
-        tk = self.tk
-        bar = tk.Frame(self.body, bg=CARD_BG)
-        bar.pack(fill="x", padx=10, pady=(8, 6))
-
-        self._dot = tk.Canvas(bar, width=9, height=9, bg=CARD_BG, highlightthickness=0)
-        self._dot.pack(side="left", padx=(2, 6))
-        self._dot_id = self._dot.create_oval(1, 1, 8, 8, fill=TXT_FAINT, outline="")
-
-        self._title = tk.Label(bar, text="Cursor", bg=CARD_BG, fg=TXT,
-                               font=("Microsoft YaHei UI", 9, "bold"))
-        self._title.pack(side="left")
-
-        close = tk.Label(bar, text="✕", bg=CARD_BG, fg=TXT_FAINT,
-                         font=("Segoe UI", 10), cursor="hand2")
-        close.pack(side="right", padx=(6, 0))
-        close.bind("<Button-1>", lambda e: self.quit())
-        close.bind("<Enter>", lambda e: close.configure(fg="#ff6b6b"))
-        close.bind("<Leave>", lambda e: close.configure(fg=TXT_FAINT))
-
-        menu_btn = tk.Label(bar, text="⋯", bg=CARD_BG, fg=TXT_FAINT,
-                            font=("Segoe UI", 11), cursor="hand2")
-        menu_btn.pack(side="right")
-        menu_btn.bind("<Button-1>", self._popup_menu)
-
-        sep = tk.Frame(self.body, bg=BORDER, height=1)
-        sep.pack(fill="x", padx=10, pady=(0, 6))
-
-    def _popup_menu(self, event) -> None:
-        tk = self.tk
-        m = tk.Menu(self.root, tearoff=0)
-        m.add_command(label="立即刷新", command=self._poll_now)
-        m.add_command(label="移回右上角", command=self._reset_position)
-        if self.collapsed:
-            m.add_command(label="展开全部项目", command=self._expand_all)
-        projects = {s.project for s in self.sessions}
-        if len(projects) > 1:
-            m.add_command(label="折叠全部项目", command=self._collapse_all)
-        m.add_command(label=f"{'取消' if self.cfg.get('topmost') else '开启'}置顶",
-                      command=self._toggle_topmost)
-        m.add_separator()
-        m.add_command(label="退出", command=self.quit)
-        try:
-            m.tk_popup(event.x_root, event.y_root)
-        finally:
-            m.grab_release()
-
-    def _expand_all(self) -> None:
-        self.collapsed.clear()
-        self._render()
-        self._save_geometry()
-
-    def _reset_position(self) -> None:
-        """把窗口放回屏幕右上角——拖到屏幕外之后靠这个找回来。"""
-        sw = self.root.winfo_screenwidth()
-        self.root.geometry(f"+{sw - int(self.cfg['width']) - 28}+48")
-        self._save_geometry()
-
-    def _collapse_all(self) -> None:
-        self.collapsed = {s.project for s in self.sessions}
-        self._render()
-        self._save_geometry()
-
-    def _toggle_topmost(self) -> None:
-        self.cfg["topmost"] = not self.cfg.get("topmost", True)
-        try:
-            self.root.attributes("-topmost", bool(self.cfg["topmost"]))
-        except Exception:
-            pass
-
-    def _redraw_bg(self, _evt=None) -> None:
-        w = self.root.winfo_width()
-        h = self.root.winfo_height()
-        if w <= 1 or h <= 1:
-            return
-        self.canvas.delete("bg")
-        if self.radius > 0:
-            self._bg_id = self._round_rect(0, 0, w - 1, h - 1, self.radius,
-                                           fill=CARD_BG, outline=BORDER, tags="bg")
-        else:
-            self._bg_id = self.canvas.create_rectangle(0, 0, w - 1, h - 1,
-                                                       fill=CARD_BG, outline=BORDER, tags="bg")
-        self.canvas.tag_lower("bg")
-
-    def _round_rect(self, x1, y1, x2, y2, r, **kw):
-        pts = [
-            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
-        ]
-        return self.canvas.create_polygon(pts, smooth=True, **kw)
-
-    # -- 拖动 ---------------------------------------------------------------
-    def _bind_drag(self, w) -> None:
-        w.bind("<Button-1>", self._drag_start, add="+")
-        w.bind("<B1-Motion>", self._drag_move, add="+")
-        w.bind("<ButtonRelease-1>", self._drag_end, add="+")
-
-    def _drag_start(self, e) -> None:
-        self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
-
-    def _drag_move(self, e) -> None:
-        if not self._drag:
-            return
-        x0, y0, wx, wy = self._drag
-        x, y = wx + e.x_root - x0, wy + e.y_root - y0
-        # 拖动时就夹住，避免把窗口拖出屏幕后彻底找不回来
-        x, y = self._clamp(x, y)
-        self.root.geometry(f"+{x}+{y}")
-
-    def _clamp(self, x: int, y: int, h: Optional[int] = None) -> tuple[int, int]:
-        """把窗口左上角夹到可视区域内（用真实高度，而不是猜一个值）。"""
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        w = int(self.cfg["width"])
-        if h is None:
-            h = max(self.root.winfo_height(), 1)
-        return max(0, min(x, max(0, sw - w))), max(0, min(y, max(0, sh - h - 4)))
-
-    def _drag_end(self, _e) -> None:
-        self._drag = None
-        self._save_geometry()
-
-    # -- 位置与折叠状态记忆 -------------------------------------------------
-    def _restore_geometry(self) -> None:
-        sw = self.root.winfo_screenwidth()
-        w = int(self.cfg["width"])
-        x, y = sw - w - 28, 60
-        if STATE_PATH.exists():
-            try:
-                st = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                x, y = int(st.get("x", x)), int(st.get("y", y))
-                self.collapsed = {str(p) for p in st.get("collapsed", [])}
-            except Exception:
-                pass
-        # 边界约束：窗口一旦被拖出屏幕就再也看不见了（实测发生过），
-        # 所以按真实高度把整个窗口夹回可视区域；渲染后再夹一次。
-        x, y = self._clamp(x, y, 140)
-        self.root.geometry(f"{w}x140+{x}+{y}")
-
-    def _save_geometry(self) -> None:
-        try:
-            STATE_PATH.write_text(json.dumps({
-                "x": self.root.winfo_x(),
-                "y": self.root.winfo_y(),
-                "collapsed": sorted(self.collapsed),
-            }, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-
-    # -- 轮询 ---------------------------------------------------------------
-    def _start_poller(self) -> None:
-        t = threading.Thread(target=self._poll_loop, daemon=True)
-        t.start()
-
-    def _poll_loop(self) -> None:
-        while self._alive:
-            try:
-                if not self.reader.available():
-                    self.q.put(("err", "找不到 state.vscdb"))
-                else:
-                    self.q.put(("data", self.reader.snapshot(self.cfg)))
-            except Exception as exc:                       # noqa: BLE001
-                self.q.put(("err", f"{type(exc).__name__}: {exc}"))
-            time.sleep(max(0.2, float(self.cfg["interval_ms"]) / 1000.0))
-
-    def _poll_now(self) -> None:
-        try:
-            self.q.put(("data", self.reader.snapshot(self.cfg)))
-        except Exception as exc:                           # noqa: BLE001
-            self.q.put(("err", str(exc)))
-
-    def _drain(self) -> None:
-        """把轮询线程的结果搬到 UI 线程，只在内容真正变化时重绘。"""
-        if not self._alive:
-            return
-        latest = None
-        err = None
-        try:
-            while True:
-                kind, payload = self.q.get_nowait()
-                if kind == "data":
-                    latest, err = payload, ""
-                else:
-                    err = str(payload)
-        except queue.Empty:
-            pass
-
-        if err is not None:
-            if err != self.error or latest is not None:
-                self.error = err
-                if latest is not None:
-                    self.sessions = latest
-                self._render()
-        elif latest is not None:
-            if self._signature(latest) != self._signature(self.sessions):
-                self.sessions = latest
-                self._render()
-        self.root.after(200, self._drain)
-
-    @staticmethod
-    def _signature(sessions: list[Session]) -> tuple:
-        return tuple(
-            (s.key, s.state, s.action_label, s.action_detail, s.project, s.title,
-             s.last_active_ms, int(s.elapsed_sec) // 10)
-            for s in sessions
-        )
-
-    def _tick_spinner(self) -> None:
-        if not self._alive:
-            return
-        self.spin = (self.spin + 1) % len(SPINNER)
-        for lbl in getattr(self, "_spin_labels", []):
-            try:
-                lbl.configure(text=SPINNER[self.spin])
-            except Exception:
-                pass
-        self.root.after(110, self._tick_spinner)
-
-    # -- 渲染 ---------------------------------------------------------------
-    def _group(self, sessions: list[Session]) -> list[tuple[str, list[Session]]]:
-        """按项目分组，组间按最近活动时间倒序；组内按最近活动时间倒序。"""
-        buckets: dict[str, list[Session]] = {}
-        for s in sessions:
-            buckets.setdefault(s.project, []).append(s)
-        for v in buckets.values():
-            v.sort(key=lambda s: -s.last_active_ms)
-        return sorted(buckets.items(),
-                      key=lambda kv: -max(s.last_active_ms for s in kv[1]))
-
-    def _render(self) -> None:
-        tk = self.tk
-        for c in self._list.winfo_children():
-            c.destroy()
-        self._spin_labels = []
-
-        running = self.sessions
-        if self.error:
-            self._dot.itemconfigure(self._dot_id, fill="#ff6b6b")
-            self._title.configure(text="Cursor · 读取异常", fg="#ff9a9a")
-            tk.Label(self._list, text=self.error, bg=CARD_BG, fg=TXT_DIM, justify="left",
-                     wraplength=int(self.cfg["width"]) - 44,
-                     font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=6)
-        elif not running:
-            self._dot.itemconfigure(self._dot_id, fill=TXT_FAINT)
-            self._title.configure(text="Cursor · 空闲", fg=TXT_DIM)
-            tk.Label(self._list, text="暂无运行中的会话", bg=CARD_BG, fg=TXT_DIM,
-                     font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=6)
-        else:
-            groups = self._group(running)
-            self._dot.itemconfigure(self._dot_id, fill=GREEN)
-            self._title.configure(
-                text=f"Cursor · 运行中 {len(running)} · {len(groups)} 个项目", fg=TXT)
-
-            shown = 0
-            overflow = 0
-            limit = int(self.cfg["max_rows"])
-            for gi, (project, items) in enumerate(groups):
-                collapsed = project in self.collapsed
-                self._render_group_header(project, items, collapsed, first=(gi == 0))
-                if collapsed:
-                    continue
-                for s in items:
-                    if shown >= limit:
-                        overflow += 1
-                        continue
-                    self._render_row(s)
-                    shown += 1
-            # 只统计被条数上限挡掉的，主动折叠的不算「另有」
-            if overflow:
-                tk.Label(self._list, text=f"… 另有 {overflow} 个会话（可折叠项目）",
-                         bg=CARD_BG, fg=TXT_FAINT,
-                         font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(4, 0))
-
-        self.root.update_idletasks()
-        self.body.place_configure(width=int(self.cfg["width"]) - 2 * self.radius)
-        self.root.update_idletasks()
-        h = self.body.winfo_reqheight() + 2 * self.radius
-        # 高度会随会话数变化，重新夹一次位置，保证窗口整体留在屏幕内
-        x, y = self._clamp(self.root.winfo_x(), self.root.winfo_y(), h)
-        self.root.geometry(f"{int(self.cfg['width'])}x{h}+{x}+{y}")
-        self._redraw_bg()
-
-    def _render_group_header(self, project: str, items: list[Session],
-                             collapsed: bool, first: bool) -> None:
-        """项目分组头：可点击折叠。折叠后仍显示会话数与最紧急的状态色。"""
-        tk = self.tk
-        color = AMBER if any(s.state == "waiting" for s in items) else GREEN
-        hdr = tk.Frame(self._list, bg=CARD_BG, cursor="hand2")
-        hdr.pack(fill="x", pady=(0 if first else 8, 2))
-
-        chevron = tk.Label(hdr, text="▸" if collapsed else "▾", bg=CARD_BG, fg=TXT_DIM,
-                           font=("Segoe UI", 8), width=2)
-        chevron.pack(side="left")
-
-        dot = tk.Canvas(hdr, width=7, height=7, bg=CARD_BG, highlightthickness=0)
-        dot.pack(side="left", padx=(0, 5), pady=(1, 0))
-        dot.create_oval(0, 0, 6, 6, fill=color, outline="")
-
-        short = project if len(project) <= 44 else project[:43] + "…"
-        name = tk.Label(hdr, text=short, bg=CARD_BG, fg=TXT, anchor="w",
-                        font=("Microsoft YaHei UI", 9, "bold"))
-        name.pack(side="left")
-
-        tk.Label(hdr, text=f" {len(items)} ", bg="#2b3038", fg=TXT_DIM,
-                 font=("Consolas", 8)).pack(side="left", padx=(6, 0))
-
-        # 折叠时把该项目正在做什么也带一句，避免完全看不到信息
-        if collapsed:
-            summary = next((s.action_label for s in items if s.action_label), "")
-            if summary:
-                tk.Label(hdr, text=summary, bg=CARD_BG, fg=TXT_FAINT,
-                         font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(8, 0))
-
-        # 整行（含计数徽标、摘要）都可点击折叠
-        for w in [hdr] + list(hdr.winfo_children()):
-            w.bind("<Button-1>", lambda e, p=project: self._toggle_group(p))
-        hdr.bind("<Enter>", lambda e: name.configure(fg=BLUE))
-        hdr.bind("<Leave>", lambda e: name.configure(fg=TXT))
-
-    def _toggle_group(self, project: str) -> str:
-        if project in self.collapsed:
-            self.collapsed.discard(project)
-        else:
-            self.collapsed.add(project)
-        self._render()
-        self._save_geometry()
-        return "break"          # 不要触发窗口拖动
-
-    def _render_row(self, s: Session) -> None:
-        """一条会话：会话名称放在主行，动作在下面。"""
-        tk = self.tk
-        wrap = int(self.cfg["width"]) - 74
-        color = AMBER if s.state == "waiting" else GREEN
-        row = tk.Frame(self._list, bg=CARD_BG)
-        row.pack(fill="x", pady=(3, 0), padx=(14, 0))
-
-        head = tk.Frame(row, bg=CARD_BG)
-        head.pack(fill="x")
-
-        dot = tk.Canvas(head, width=8, height=8, bg=CARD_BG, highlightthickness=0)
-        dot.pack(side="left", pady=(4, 0))
-        dot.create_oval(1, 1, 7, 7, fill=color, outline="")
-
-        tk.Label(head, text=fmt_elapsed(s.elapsed_sec), bg=CARD_BG, fg=TXT_FAINT,
-                 font=("Consolas", 8)).pack(side="right")
-
-        badges = []
-        if s.is_subagent:
-            badges.append(("子代理", "#2b3038", BLUE))
-        if s.state == "waiting":
-            badges.append(("等待确认", "#3a3020", AMBER))
-        for text, bg, fg in reversed(badges):
-            tk.Label(head, text=text, bg=bg, fg=fg,
-                     font=("Microsoft YaHei UI", 7), padx=4).pack(side="right", padx=(0, 5))
-
-        # 会话名称：主信息，用亮色
-        tk.Label(head, text=s.title, bg=CARD_BG, fg=TXT, anchor="w", justify="left",
-                 wraplength=wrap - 60,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(6, 4))
-
-        if s.action_label:
-            act = tk.Frame(row, bg=CARD_BG)
-            act.pack(fill="x", padx=(14, 0), pady=(1, 0))
-            spin = tk.Label(act, text=SPINNER[self.spin], bg=CARD_BG, fg=color,
-                            font=("Segoe UI", 9))
-            spin.pack(side="left")
-            self._spin_labels.append(spin)
-            txt = s.action_label + (f": {s.action_detail}" if s.action_detail else "")
-            tk.Label(act, text=txt, bg=CARD_BG, fg=color, anchor="w", justify="left",
-                     wraplength=wrap - 16, font=("Microsoft YaHei UI", 8)).pack(
-                side="left", padx=(4, 0), fill="x")
-
-    # -- 生命周期 -----------------------------------------------------------
-    def quit(self) -> None:
-        self._alive = False
-        self._save_geometry()
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def run(self) -> None:
-        self._render()
-        self.root.mainloop()
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
-
-def demo_sessions() -> list[Session]:
-    """用于在没有真实运行会话时校验窗口渲染效果（--demo）。
-
-    刻意做成「一个项目下两个会话 + 另外两个项目各一个」，用来检查分组与折叠。
-    这里全部使用编造的示例名称——它会出现在 README 的截图里，不要填真实项目名。
-    """
-    t = int(time.time() * 1000)
-    return [
-        Session(
-            composer_id="demo-1",
-            project="acme-web · feat-auth-refresh",
-            title="修复登录态刷新竞态", state="running",
-            action_label="执行命令",
-            action_detail="npm run test:e2e -- --grep \"token refresh\"",
-            elapsed_sec=83, last_active_ms=t - 1000, signals=["tool=running"],
-        ),
-        Session(
-            composer_id="demo-2",
-            project="acme-web · feat-auth-refresh",
-            title="补 auth 模块单测", state="running",
-            action_label="生成回复中",
-            action_detail="正在写 tests/auth/refresh.spec.ts", elapsed_sec=21,
-            is_subagent=True, subagent_type="generalPurpose",
-            last_active_ms=t - 3000, signals=["generatingBubbleIds"],
-        ),
-        Session(
-            composer_id="demo-3", project="shop-api", title="给下单接口加幂等键",
-            state="running", action_label="编辑文件",
-            action_detail="src/order/idempotency.ts", elapsed_sec=132,
-            last_active_ms=t - 20000, signals=["tool=running"],
-        ),
-        Session(
-            composer_id="demo-4", project="data-pipeline", title="排查 worker 内存溢出",
-            state="waiting", action_label="执行命令",
-            action_detail="docker compose restart worker",
-            elapsed_sec=310, last_active_ms=t - 60000, signals=["hasBlockingPendingActions"],
-        ),
-    ]
-
 
 def main(argv: Optional[list[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Cursor 运行中会话悬浮窗")
+    ap = argparse.ArgumentParser(description="Cursor 运行中会话的数据层 / 诊断工具")
     ap.add_argument("--once", action="store_true", help="打印一次快照后退出")
     ap.add_argument("--watch", action="store_true", help="终端持续输出")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
-    ap.add_argument("--signals", action="store_true", help="显示判定依据明细")
+    ap.add_argument("--signals", action="store_true", help="显示每个会话的判定依据明细")
     ap.add_argument("--settle", type=float, default=4.0,
                     help="--once 最多观察这么多秒再下结论：判定依赖内容变化，"
                          "只查一轮可能误报为空（0 表示只查一轮）")
-    ap.add_argument("--demo", action="store_true", help="用假数据渲染窗口（调试 UI）")
     args = ap.parse_args(argv)
 
     cfg = load_config()
     reader = CursorReader()
-
-    if args.demo:
-        win = FloatWindow(cfg, reader, poll=False)
-        win.sessions = demo_sessions()
-        win.run()
-        return 0
-
     if not reader.available():
         print(f"[cursor-float] 未找到 {DB_PATH}", file=sys.stderr)
         return 2
 
-    if args.once or args.watch or args.json:
-        interval = max(0.2, float(cfg["interval_ms"]) / 1000.0)
-        try:
-            settle = max(0.0, float(args.settle)) if not args.watch else 0.0
-            deadline = time.time() + settle
-            rounds = 0
-            while True:
-                rounds += 1
-                try:
-                    snaps = reader.snapshot(cfg)
-                    err = ""
-                except Exception as exc:                   # noqa: BLE001
-                    snaps, err = [], f"{type(exc).__name__}: {exc}"
-                # 判定依赖「内容较上一轮有变化」，所以只看一轮可能误报为空。
-                # --once 时给一点观察时间，等不到再下结论。
-                if args.watch or snaps or time.time() >= deadline:
-                    break
-                time.sleep(interval)
-            if args.json:
-                print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
-                                  "probe": reader.last_probe,
-                                  "rounds": rounds,
-                                  "error": err}, ensure_ascii=False))
-            else:
-                out = render_text(snaps, err,
-                                  reader.last_probe if args.signals else None)
-                if rounds > 1:
-                    out += (f"\n  （观察了 {rounds} 轮 / {settle:g} 秒；"
-                            f"判定依赖内容变化，单轮可能看不到正在跑的会话）")
-                print(out, flush=True)
-            if args.watch:
-                while True:
-                    time.sleep(interval)
-                    try:
-                        snaps = reader.snapshot(cfg)
-                        err = ""
-                    except Exception as exc:               # noqa: BLE001
-                        snaps, err = [], f"{type(exc).__name__}: {exc}"
-                    if args.json:
-                        print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
-                                          "probe": reader.last_probe,
-                                          "error": err}, ensure_ascii=False))
-                    else:
-                        print(render_text(snaps, err,
-                                          reader.last_probe if args.signals else None),
-                              flush=True)
-        except KeyboardInterrupt:
-            pass
+    if not (args.once or args.watch or args.json):
+        ap.print_help()
         return 0
 
-    FloatWindow(cfg, reader).run()
+    interval = max(0.2, float(cfg["interval_ms"]) / 1000.0)
+    settle = 0.0 if args.watch else max(0.0, float(args.settle))
+    deadline = time.time() + settle
+    rounds = 0
+    try:
+        # 判定依赖「内容较上一轮有变化」，所以只看一轮可能误报为空。
+        while True:
+            rounds += 1
+            try:
+                snaps, err = reader.snapshot(cfg), ""
+            except Exception as exc:                       # noqa: BLE001
+                snaps, err = [], f"{type(exc).__name__}: {exc}"
+            if args.watch or snaps or time.time() >= deadline:
+                break
+            time.sleep(interval)
+        _emit(args, snaps, err, reader, rounds, settle)
+
+        while args.watch:
+            time.sleep(interval)
+            try:
+                snaps, err = reader.snapshot(cfg), ""
+            except Exception as exc:                       # noqa: BLE001
+                snaps, err = [], f"{type(exc).__name__}: {exc}"
+            _emit(args, snaps, err, reader, 0, 0.0)
+    except KeyboardInterrupt:
+        pass
     return 0
+
+
+def _emit(args, snaps, err, reader, rounds: int, settle: float) -> None:
+    if args.json:
+        print(json.dumps({"sessions": [session_to_dict(s) for s in snaps],
+                          "probe": reader.last_probe,
+                          "rounds": rounds,
+                          "error": err}, ensure_ascii=False))
+        return
+    out = render_text(snaps, err, reader.last_probe if args.signals else None)
+    if rounds > 1:
+        out += (f"\n  （观察了 {rounds} 轮 / {settle:g} 秒；"
+                f"判定依赖内容变化，单轮可能看不到正在跑的会话）")
+    print(out, flush=True)
 
 
 if __name__ == "__main__":

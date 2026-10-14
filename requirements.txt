@@ -1,0 +1,5 @@
+# 运行浮窗需要
+PySide6>=6.6
+
+# 仅 --shot / tools/capture.py 截图时需要，浮窗本身不依赖
+Pillow>=10

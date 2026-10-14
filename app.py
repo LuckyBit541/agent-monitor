@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""cursor-float 的窗口层：一个无边框、逐像素半透明的浮窗，显示正在运行的 Cursor 会话。
+
+窗口是 Qt 的 WA_TranslucentBackground 窗口，页面里每个像素的 alpha 都直接和桌面
+混合，所以「透明度」只淡化卡片背景（CSS 变量 --bg-alpha），文字和圆点始终不透明。
+圆角之外的区域是真正透明的。
+
+界面逻辑在 card.html，数据判定在 sessions.py。三种显示模式（详细 / 简约 / 最简）
+由标题栏最左边的按钮循环切换。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from sessions import CursorReader, load_config
+from window_state import (
+    MAX_HEIGHT,
+    MIN_HEIGHT,
+    MODES,
+    STATE_PATH,
+    WIDTHS,
+    group_sessions,
+    initial_position,
+    load_state,
+    normalize_mode,
+    normalize_opacity,
+    payload as build_payload,
+    save_state,
+    saved_corner,
+    signature,
+)
+
+CARD_PATH = Path(__file__).with_name("card.html")
+
+# 这台机器上 QtWebEngine 的 GPU 合成会失败（日志里是 "Compositor returned null
+# texture"），表现是窗口完全透明、屏幕上什么都看不到——很容易被误判成程序没启动。
+# 必须在 QApplication 创建之前关掉 GPU 合成。想自己调的话，启动前设这个环境变量即可。
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                      "--disable-gpu --disable-gpu-compositing")
+
+
+def _fail(message: str) -> None:
+    """报告致命的启动问题。
+
+    启动器用 pythonw 运行本程序，那里没有控制台能显示错误，所以同时落到状态文件旁边。
+    """
+    print(message, file=sys.stderr)
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        (STATE_PATH.parent / "last-error.log").write_text(
+            f"{datetime.now().isoformat(timespec='seconds')} {message}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+try:
+    from PySide6.QtCore import QFile, QIODevice, QObject, QPoint, Qt, QTimer, QUrl, Signal, Slot
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWebChannel import QWebChannel
+    from PySide6.QtWebEngineCore import QWebEngineScript
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWidgets import QApplication
+except ImportError:                                   # pragma: no cover
+    _fail("缺少依赖 PySide6，请先运行: pip install -r requirements.txt")
+    sys.exit(1)
+
+
+WINDOW_TITLE = "Cursor 运行中会话"
+DEBUG = bool(os.environ.get("CURSOR_FLOAT_DEBUG"))
+
+# 首帧的估算高度，页面测出真实值后会立刻纠正
+WINDOW_HEIGHT = 200
+
+# 页面可以调用的方法。不在这个表里的一律拒绝。
+PAGE_CALLS = (
+    "refresh",
+    "request_refresh",
+    "report_size",
+    "set_mode",
+    "set_opacity",
+    "set_pinned",
+    "toggle_group",
+    "expand_all",
+    "collapse_all",
+    "start_move",
+    "hide",
+)
+# 会读数据库、耗时较久的调用放到后台线程，避免界面卡住
+BACKGROUND_CALLS = frozenset({"refresh"})
+
+LOG = logging.getLogger("cursor-float")
+
+
+
+# -------------------------------------------------------------------- 桥接
+
+class Bridge(QObject):
+    """卡片页面的 Python 端，通过 QWebChannel 访问。
+
+    页面调用 call(id, name, args)，答案回到 reply；后台轮询的新快照走 pushed。
+    两者都传 JSON，避免任何 Qt 类型转换。
+    """
+
+    reply = Signal(int, str)
+    pushed = Signal(str)
+
+    def __init__(self, state: dict, cfg: dict) -> None:
+        super().__init__()
+        self._state = state
+        self._cfg = cfg
+        self._view: CardWindow | None = None
+        self._reader = CursorReader()
+        # 轮询线程和 refresh 调用都会用 reader，而 reader 内部的指纹是有状态的，
+        # 必须串行化，否则判定会互相干扰。
+        self._lock = threading.Lock()
+        self._refresh_event = threading.Event()
+        self._closed = threading.Event()
+        self._last_signature: tuple | None = None
+        self._last_error = ""
+        self._worker: threading.Thread | None = None
+
+    # ------------------------------------------------------------ 分发
+
+    @Slot(int, str, str)
+    def call(self, request_id: int, name: str, args_json: str) -> None:
+        if name not in PAGE_CALLS:
+            self._answer(request_id, error=f"unknown call: {name}")
+            return
+        try:
+            args = json.loads(args_json) if args_json else []
+        except json.JSONDecodeError:
+            args = []
+        if not isinstance(args, list):
+            args = [args]
+        if name in BACKGROUND_CALLS:
+            threading.Thread(target=self._run, args=(request_id, name, args),
+                             daemon=True).start()
+        else:
+            self._run(request_id, name, args)
+
+    def _run(self, request_id: int, name: str, args: list) -> None:
+        try:
+            value = getattr(self, name)(*args)
+        except Exception as exc:                       # noqa: BLE001 - 把原因回给页面
+            LOG.warning("调用 %s 失败: %s", name, exc)
+            self._answer(request_id, error=str(exc))
+            return
+        self._answer(request_id, value)
+
+    def _answer(self, request_id: int, value: Any = None, error: str | None = None) -> None:
+        payload = {"ok": error is None, "value": value, "error": error}
+        self.reply.emit(request_id, json.dumps(payload, ensure_ascii=False))
+
+    # ------------------------------------------------------------ 设置
+
+    def _settings(self) -> dict:
+        return {
+            "mode": normalize_mode(self._state.get("mode")),
+            "opacity": normalize_opacity(self._state.get("opacity", 1)),
+            "pinned": bool(self._state.get("pinned", True)),
+        }
+
+    def _store(self, **changes: Any) -> dict:
+        self._state.update(changes)
+        save_state(self._state)
+        return self._settings()
+
+    def _collapsed(self) -> set:
+        return set(self._state.get("collapsed") or [])
+
+    # ------------------------------------------------------- 页面可调用
+
+    def _collect(self) -> dict:
+        """读一次会话状态，整理成页面需要的结构。"""
+        error = ""
+        try:
+            with self._lock:
+                sessions = self._reader.snapshot(self._cfg)
+        except Exception as exc:                       # noqa: BLE001
+            sessions, error = [], f"{type(exc).__name__}: {exc}"
+        collapsed = self._collapsed()
+        self._last_signature = signature(sessions, collapsed, error)
+        self._last_error = error
+        return build_payload(
+            sessions, collapsed, self._settings(),
+            float(self._cfg["interval_ms"]) / 1000.0,
+            datetime.now().strftime("%H:%M:%S"), error,
+        )
+
+    def refresh(self) -> dict:
+        return self._collect()
+
+    def request_refresh(self) -> bool:
+        self._refresh_event.set()
+        return True
+
+    def report_size(self, width: float, height: float) -> bool:
+        """按卡片实际尺寸调整窗口，避免背景露出或内容被裁切。"""
+        if self._view is None:
+            return False
+        try:
+            w = int(round(float(width)))
+            h = int(round(float(height)))
+        except (TypeError, ValueError):
+            return False
+        if h <= 0 or w <= 0:
+            return False
+        self._view.fit_size(w, h)
+        return True
+
+    def set_mode(self, mode: str) -> dict:
+        return self._store(mode=normalize_mode(mode))
+
+    def set_opacity(self, opacity: float) -> dict:
+        return self._store(opacity=normalize_opacity(opacity))
+
+    def set_pinned(self, pinned: bool) -> dict:
+        settings = self._store(pinned=bool(pinned))
+        if self._view is not None:
+            self._view.set_on_top(settings["pinned"])
+        return settings
+
+    def toggle_group(self, project: str) -> dict:
+        collapsed = self._collapsed()
+        name = str(project)
+        if name in collapsed:
+            collapsed.discard(name)
+        else:
+            collapsed.add(name)
+        self._store(collapsed=sorted(collapsed))
+        # 折叠状态变了要立刻重画；轮询线程也会带上新状态
+        self.pushed.emit(json.dumps(self._collect(), ensure_ascii=False))
+        return self._settings()
+
+    def expand_all(self) -> dict:
+        self._store(collapsed=[])
+        self.pushed.emit(json.dumps(self._collect(), ensure_ascii=False))
+        return self._settings()
+
+    def collapse_all(self) -> dict:
+        projects = {g["project"] for g in group_sessions(self._reader_sessions(), self._collapsed())}
+        self._store(collapsed=sorted(projects))
+        self.pushed.emit(json.dumps(self._collect(), ensure_ascii=False))
+        return self._settings()
+
+    def _reader_sessions(self) -> list:
+        try:
+            with self._lock:
+                return self._reader.snapshot(self._cfg)
+        except Exception:                              # noqa: BLE001
+            return []
+
+    def start_move(self) -> bool:
+        if self._view is None:
+            return False
+        handle = self._view.windowHandle()
+        return bool(handle and handle.startSystemMove())
+
+    def hide(self) -> bool:
+        if self._view is not None:
+            self._view.close()
+        return True
+
+    # ------------------------------------------------------------ 生命周期
+
+    def start_worker(self) -> None:
+        thread = self._worker
+        if thread is not None and thread.is_alive():
+            return
+        self._worker = threading.Thread(target=_serve, args=(self,), daemon=True)
+        self._worker.start()
+
+    def _shutdown(self) -> None:
+        self._closed.set()
+        self._refresh_event.set()
+
+
+def _serve(bridge: Bridge) -> None:
+    """后台循环：按轮询间隔检查会话，只有内容真的变了才推给页面。
+
+    只在变化时推送很重要：每次推送都会触发页面重排和高度自测，无脑推送会让
+    窗口不停地重新测量。
+    """
+    interval = max(0.2, float(bridge._cfg["interval_ms"]) / 1000.0)
+    while not bridge._closed.is_set():
+        bridge._refresh_event.wait(interval)
+        bridge._refresh_event.clear()
+        if bridge._closed.is_set():
+            return
+        try:
+            payload = bridge._collect()
+        except Exception as exc:                       # noqa: BLE001 - 别让循环挂掉
+            LOG.warning("采集会话状态失败: %s", exc)
+            continue
+        if bridge._closed.is_set():
+            return
+        if payload["error"] or payload["running"] or bridge._last_signature is not None:
+            bridge.pushed.emit(json.dumps(payload, ensure_ascii=False))
+
+
+# ------------------------------------------------------------------- 窗口
+
+def _bridge_script() -> QWebEngineScript:
+    """桥接的页面端：window.cursorBridge，方法都返回 Promise。"""
+    source = QFile(":/qtwebchannel/qwebchannel.js")
+    if not source.open(QIODevice.ReadOnly):
+        raise RuntimeError("Qt 资源里缺少 qwebchannel.js")
+    library = bytes(source.readAll()).decode("utf-8")
+    source.close()
+    shim = """
+new QWebChannel(qt.webChannelTransport, (channel) => {
+  const host = channel.objects.bridge;
+  const pending = new Map();
+  let next = 0;
+  host.reply.connect((id, payload) => {
+    const waiter = pending.get(id);
+    if (!waiter) return;
+    pending.delete(id);
+    const answer = JSON.parse(payload);
+    if (answer.ok) waiter.resolve(answer.value);
+    else waiter.reject(new Error(answer.error));
+  });
+  host.pushed.connect((payload) => {
+    if (window.cursorFloat) window.cursorFloat.apply(JSON.parse(payload));
+  });
+  const bridge = {};
+  for (const name of %s) {
+    bridge[name] = (...args) => new Promise((resolve, reject) => {
+      const id = ++next;
+      pending.set(id, { resolve, reject });
+      host.call(id, name, JSON.stringify(args));
+    });
+  }
+  window.cursorBridge = bridge;
+  window.dispatchEvent(new Event("cursorbridgeready"));
+});
+""" % json.dumps(PAGE_CALLS)
+    script = QWebEngineScript()
+    script.setName("cursor-bridge")
+    script.setSourceCode(library + "\n" + shim)
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+    script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    script.setRunsOnSubFrames(False)
+    return script
+
+
+def _screen_area(x: int, y: int) -> tuple[int, int, int, int]:
+    """(x, y) 所在显示器的工作区，显示器不在了就退回主屏。"""
+    screen = QGuiApplication.screenAt(QPoint(x, y)) or QGuiApplication.primaryScreen()
+    rect = screen.availableGeometry()
+    return rect.left(), rect.top(), rect.left() + rect.width(), rect.top() + rect.height()
+
+
+class CardWindow(QWebEngineView):
+    """无边框、逐像素半透明的窗口，承载 card.html。"""
+
+    def __init__(self, bridge: Bridge) -> None:
+        super().__init__()
+        self._bridge = bridge
+        self._ready = False
+        self._width = WIDTHS[normalize_mode(bridge._state.get("mode"))]
+        state = bridge._state
+
+        self.setWindowTitle(WINDOW_TITLE)
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
+        if bool(state.get("pinned", True)):
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.page().setBackgroundColor(Qt.GlobalColor.transparent)
+
+        self._channel = QWebChannel(self.page())
+        self._channel.registerObject("bridge", bridge)
+        self.page().setWebChannel(self._channel)
+        self.page().scripts().insert(_bridge_script())
+
+        # 拖动过程中会持续触发 moveEvent，等停下来再保存位置
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self._save_position)
+
+        x, y = initial_position(state, _screen_area(*saved_corner(state)), self._width)
+        if DEBUG:
+            LOG.info("初始位置=%s,%s 模式=%s", x, y, state.get("mode"))
+        self.setGeometry(x, y, self._width, WINDOW_HEIGHT)
+        self.load(QUrl.fromLocalFile(str(CARD_PATH)))
+        self._ready = True
+
+    def fit_size(self, width: int, height: int) -> None:
+        """按卡片上报的尺寸调整窗口，并保证窗口整体留在屏幕内。"""
+        self._width = max(120, min(760, width))
+        _left, top, right, bottom = _screen_area(self.x(), self.y())
+        room = bottom - self.y() - 8
+        target = max(MIN_HEIGHT, min(MAX_HEIGHT, height, max(MIN_HEIGHT, room)))
+        if target != self.height() or self._width != self.width():
+            self.resize(self._width, target)
+        # 高度变了可能把底边推出屏幕，重新夹一次
+        x = max(_left, min(self.x(), right - self._width))
+        y = max(top, min(self.y(), bottom - target - 4))
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+
+    def set_on_top(self, pinned: bool) -> None:
+        # QWindow.setFlag 原地更新原生窗口；QWidget 的等价操作会重建窗口，
+        # 那会闪一下并重新加载页面。
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setFlag(Qt.WindowType.WindowStaysOnTopHint, pinned)
+
+    def moveEvent(self, event) -> None:                # noqa: N802 - Qt 覆写
+        super().moveEvent(event)
+        if self._ready:
+            self._save_timer.start()
+
+    def closeEvent(self, event) -> None:               # noqa: N802 - Qt 覆写
+        self._save_timer.stop()
+        self._save_position()
+        self._bridge._shutdown()
+        super().closeEvent(event)
+
+    def _save_position(self) -> None:
+        self._bridge._store(x=self.x(), y=self.y())
+
+
+def _capture(path: str, view: CardWindow) -> None:
+    """--shot：把窗口当前的样子截成 PNG。"""
+    from PIL import ImageGrab
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ratio = view.devicePixelRatioF()
+    rect = view.frameGeometry()
+    ImageGrab.grab(bbox=(
+        int(rect.left() * ratio), int(rect.top() * ratio),
+        int((rect.left() + rect.width()) * ratio),
+        int((rect.top() + rect.height()) * ratio),
+    )).save(target)
+    view.close()
+
+
+SELFTEST_JS = """
+(() => {
+  const out = {steps: []};
+  out.hasBridge = Boolean(window.cursorBridge);
+  const body = () => document.body.className;
+  out.startMode = body();
+  document.getElementById('btnMode').click();
+  out.afterModeClick = body();
+  document.getElementById('btnAlpha').click();
+  out.alpha = getComputedStyle(document.documentElement).getPropertyValue('--bg-alpha').trim();
+  document.getElementById('btnPin').click();
+  out.pinActive = document.getElementById('btnPin').classList.contains('on');
+  const head = document.querySelector('.ghead');
+  out.hasGroups = Boolean(head);
+  if (head) { head.click(); out.afterGroupClick = document.querySelector('.ghead').className; }
+  out.title = document.getElementById('title').textContent;
+  return JSON.stringify(out);
+})();
+"""
+
+
+def _selftest(view: CardWindow) -> None:
+    """点一遍卡片上的按钮，回读页面状态，证明交互链路是通的。"""
+    def report(result: Any) -> None:
+        print("[selftest]", result)
+        view.close()
+        QApplication.quit()
+
+    view.page().runJavaScript(SELFTEST_JS, report)
+
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="悬浮显示 Cursor 中正在运行的会话")
+    parser.add_argument("--shot", help=argparse.SUPPRESS)
+    parser.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--mode", choices=MODES, help="以指定模式启动（会被写入状态）")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="[cursor-float] %(message)s")
+
+    application = QApplication(sys.argv[:1])
+    state = load_state()
+    if args.mode:
+        state["mode"] = args.mode
+    cfg = load_config()
+    if DEBUG:
+        LOG.info("状态文件=%s 状态=%s 配置=%s", STATE_PATH, state, cfg)
+    bridge = Bridge(state, cfg)
+    view = CardWindow(bridge)
+    bridge._view = view
+    bridge.start_worker()
+    view.show()
+    if args.shot:
+        QTimer.singleShot(6000, lambda: _capture(args.shot, view))
+    if args.selftest:
+        QTimer.singleShot(5000, lambda: _selftest(view))
+    application.exec()
+    bridge._shutdown()
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)

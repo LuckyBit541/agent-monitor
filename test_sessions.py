@@ -14,7 +14,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-import cursor_float as cf
+import sessions as cf
 
 SCHEMA = """
 CREATE TABLE composerHeaders (

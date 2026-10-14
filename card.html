@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cursor 会话</title>
+<style>
+  /*
+    透明度只作用于「背景层」：所有背景色都写成
+        rgba(r, g, b, calc(基础值 * var(--bg-alpha)))
+    文字、圆点、图标一律使用不透明颜色，所以把 --bg-alpha 调低时能透过卡片看到
+    后面的内容，而数字和标题依然清晰。这是 Qt 逐像素半透明窗口才能做到的效果。
+  */
+  :root {
+    --bg-alpha: 1;
+    --card: 16, 19, 24;
+    --line: 255, 255, 255;
+    --txt: #e7e9ec;
+    --dim: #9aa1ab;
+    --faint: #6f767f;
+    --green: #3ecf72;
+    --amber: #e5a53a;
+    --blue: #62a8ff;
+    --w: 400px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: transparent;
+    overflow: hidden;
+    font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+  }
+
+  #shell {
+    width: var(--w);
+    border-radius: 14px;
+    overflow: hidden;
+    /* 只有这一层背景受透明度影响 */
+    background: linear-gradient(180deg,
+                rgba(var(--card), calc(0.97 * var(--bg-alpha))),
+                rgba(11, 13, 17, calc(0.97 * var(--bg-alpha))));
+    border: 1px solid rgba(var(--line), calc(0.09 * var(--bg-alpha)));
+    box-shadow: 0 10px 30px rgba(0, 0, 0, calc(0.45 * var(--bg-alpha)));
+  }
+
+  /* ---------------------------------------------------------------- 标题栏 */
+  #bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px 7px;
+    border-bottom: 1px solid rgba(var(--line), calc(0.07 * var(--bg-alpha)));
+  }
+
+  #dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--faint);
+    flex: none;
+  }
+  #dot.on   { background: var(--green); box-shadow: 0 0 7px rgba(62, 207, 114, .55); }
+  #dot.warn { background: var(--amber); box-shadow: 0 0 7px rgba(229, 165, 58, .55); }
+  #dot.err  { background: #ff6b6b; }
+
+  #title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--txt);
+    white-space: nowrap;
+  }
+  #title.idle { color: var(--dim); font-weight: 500; }
+
+  .spacer { flex: 1 1 auto; }
+
+  .btn {
+    width: 22px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: rgba(var(--line), calc(0.06 * var(--bg-alpha)));
+    color: var(--dim);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    flex: none;
+    transition: background .12s, color .12s;
+  }
+  .btn:hover { background: rgba(var(--line), calc(0.14 * var(--bg-alpha))); color: var(--txt); }
+  .btn.on { color: var(--amber); background: rgba(229, 165, 58, .16); }
+  #btnClose:hover { background: rgba(255, 107, 107, .22); color: #ff8f8f; }
+
+  /* ---------------------------------------------------------------- 内容 */
+  #content { padding: 8px 10px 10px; }
+
+  #empty, #error {
+    font-size: 12px;
+    color: var(--dim);
+    padding: 6px 2px 4px;
+  }
+  #error { color: #ff9a9a; word-break: break-all; }
+
+  .group { margin-top: 8px; }
+  .group:first-child { margin-top: 0; }
+
+  .ghead {
+    display: flex; align-items: center; gap: 6px;
+    padding: 2px 0 3px;
+    cursor: pointer;
+  }
+  .chev {
+    width: 9px; flex: none;
+    color: var(--faint);
+    font-size: 9px;
+    transition: transform .12s;
+  }
+  .ghead.folded .chev { transform: rotate(-90deg); }
+
+  .gdot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--green); }
+  .gdot.warn { background: var(--amber); }
+
+  .gname {
+    font-size: 12.5px; font-weight: 600; color: var(--txt);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ghead:hover .gname { color: var(--blue); }
+
+  .gcount {
+    font-size: 10px; color: var(--dim);
+    background: rgba(var(--line), calc(0.09 * var(--bg-alpha)));
+    border-radius: 4px; padding: 1px 5px;
+    flex: none;
+  }
+  .gsum { font-size: 11px; color: var(--faint); white-space: nowrap; }
+
+  .row { padding: 3px 0 0 15px; }
+
+  .rhead { display: flex; align-items: center; gap: 6px; }
+  .rdot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--green); }
+  .rdot.warn { background: var(--amber); }
+
+  .rname {
+    font-size: 12.5px; color: var(--txt);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rtime { margin-left: auto; font-size: 10.5px; color: var(--faint); font-family: Consolas, monospace; flex: none; }
+
+  .tag {
+    font-size: 9.5px; padding: 1px 4px; border-radius: 4px; flex: none;
+    background: rgba(var(--line), calc(0.1 * var(--bg-alpha))); color: var(--dim);
+  }
+  .tag.sub { color: var(--blue); }
+  .tag.wait { color: var(--amber); background: rgba(229, 165, 58, .16); }
+
+  .act {
+    display: flex; gap: 4px; align-items: flex-start;
+    padding: 2px 0 0 13px;
+    font-size: 11.5px; color: var(--green);
+    line-height: 1.35;
+  }
+  .act.warn { color: var(--amber); }
+  .act .what { word-break: break-all; }
+  .spin { flex: none; animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  #foot {
+    padding: 5px 10px 8px;
+    font-size: 10.5px; color: var(--faint);
+    border-top: 1px solid rgba(var(--line), calc(0.06 * var(--bg-alpha)));
+  }
+
+  /* ------------------------------------------------------- 简约 / 最简模式 */
+  body.mode-compact .act,
+  body.mode-compact #foot { display: none; }
+  body.mode-compact .row { padding-top: 2px; }
+
+  body.mode-mini { --w: 246px; }
+  body.mode-mini #content { padding: 0 10px 9px; }
+  body.mode-mini #title,
+  body.mode-mini #foot,
+  body.mode-mini .group { display: none; }
+  body.mode-mini #bar { border-bottom: none; padding-bottom: 0; }
+  body.mode-mini #mini { display: flex; }
+
+  #mini {
+    display: none;
+    align-items: baseline;
+    gap: 7px;
+    font-size: 13px;
+    color: var(--txt);
+    padding-left: 1px;
+  }
+  #mini .num { font-size: 17px; font-weight: 700; color: var(--green); font-family: Consolas, monospace; }
+  #mini.warn .num { color: var(--amber); }
+  #mini .unit { font-size: 11.5px; color: var(--dim); }
+
+  body.mode-detail #mini, body.mode-compact #mini { display: none; }
+</style>
+</head>
+<body class="mode-detail">
+<div id="shell">
+  <header id="bar">
+    <span id="dot"></span>
+    <span id="title">Cursor</span>
+    <span class="spacer"></span>
+    <button class="btn" id="btnMode"    title="切换显示模式（详细 / 简约 / 最简）">▤</button>
+    <button class="btn" id="btnAlpha"   title="调整背景透明度">◐</button>
+    <button class="btn" id="btnPin"     title="窗口置顶">📌</button>
+    <button class="btn" id="btnRefresh" title="立即刷新">⟳</button>
+    <button class="btn" id="btnClose"   title="关闭">✕</button>
+  </header>
+
+  <div id="content">
+    <div id="mini"><span class="num" id="miniNum">0</span><span class="unit" id="miniUnit">个会话运行中</span></div>
+    <div id="list"></div>
+    <div id="empty" hidden>暂无运行中的会话</div>
+    <div id="error" hidden></div>
+  </div>
+
+  <div id="foot"></div>
+</div>
+
+<script>
+"use strict";
+
+const MODES = ["detail", "compact", "mini"];
+const OPACITIES = [1, 0.85, 0.7, 0.55, 0.4, 0.25];
+const WIDTHS = { detail: 400, compact: 400, mini: 246 };
+const HEIGHT_CUSHION = 2;
+
+const state = { mode: "detail", opacity: 1, pinned: true, data: null };
+const shell = document.getElementById("shell");
+const listEl = document.getElementById("list");
+const emptyEl = document.getElementById("empty");
+const errorEl = document.getElementById("error");
+const footEl = document.getElementById("foot");
+const dotEl = document.getElementById("dot");
+const titleEl = document.getElementById("title");
+
+function api() { return window.cursorBridge; }
+
+/* ---------------------------------------------------------------- 工具 */
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function fmtElapsed(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  if (sec < 60) return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m" + String(sec % 60).padStart(2, "0") + "s";
+  return Math.floor(sec / 3600) + "h" + String(Math.floor((sec % 3600) / 60)).padStart(2, "0") + "m";
+}
+
+/* ---------------------------------------------------------------- 渲染 */
+function renderGroups(groups) {
+  listEl.textContent = "";
+  for (const group of groups) {
+    const box = el("div", "group");
+
+    const head = el("div", "ghead" + (group.collapsed ? " folded" : ""));
+    head.appendChild(el("span", "chev", "▾"));
+    head.appendChild(el("span", "gdot" + (group.warn ? " warn" : "")));
+    head.appendChild(el("span", "gname", group.project));
+    head.appendChild(el("span", "gcount", String(group.sessions.length)));
+    if (group.collapsed) {
+      const sum = group.sessions.find(s => s.action) || {};
+      if (sum.action) head.appendChild(el("span", "gsum", sum.action));
+    }
+    head.addEventListener("click", () => {
+      const bridge = api();
+      if (bridge) bridge.toggle_group(group.project).catch(() => {});
+    });
+    box.appendChild(head);
+
+    if (!group.collapsed) {
+      for (const session of group.sessions) {
+        const row = el("div", "row");
+        const rhead = el("div", "rhead");
+        rhead.appendChild(el("span", "rdot" + (session.state === "waiting" ? " warn" : "")));
+        rhead.appendChild(el("span", "rname", session.title));
+        if (session.isSubagent) rhead.appendChild(el("span", "tag sub", "子代理"));
+        if (session.state === "waiting") rhead.appendChild(el("span", "tag wait", "等待确认"));
+        rhead.appendChild(el("span", "rtime", fmtElapsed(session.elapsedSec)));
+        row.appendChild(rhead);
+
+        if (session.action) {
+          const act = el("div", "act" + (session.state === "waiting" ? " warn" : ""));
+          act.appendChild(el("span", "spin", "◐"));
+          const what = session.action + (session.detail ? ": " + session.detail : "");
+          act.appendChild(el("span", "what", what));
+          row.appendChild(act);
+        }
+        box.appendChild(row);
+      }
+    }
+    listEl.appendChild(box);
+  }
+}
+
+function apply(data) {
+  state.data = data;
+  const settings = (data && data.settings) || {};
+  if (MODES.includes(settings.mode)) state.mode = settings.mode;
+  if (typeof settings.opacity === "number") state.opacity = settings.opacity;
+  state.pinned = Boolean(settings.pinned);
+
+  const running = Number(data.running || 0);
+  const waiting = Number(data.waiting || 0);
+  const error = data.error || "";
+
+  emptyEl.hidden = running > 0 || Boolean(error);
+  errorEl.hidden = !error;
+  errorEl.textContent = error;
+
+  renderGroups(data.groups || []);
+
+  const dotClass = error ? "err" : (waiting ? "warn" : (running ? "on" : ""));
+  dotEl.className = dotClass;
+  titleEl.className = running ? "" : "idle";
+  titleEl.textContent = running
+    ? `Cursor · 运行中 ${running}`
+    : (error ? "Cursor · 读取异常" : "Cursor · 空闲");
+
+  document.getElementById("miniNum").textContent = String(running);
+  document.getElementById("miniUnit").textContent = running ? "个会话运行中" : "空闲";
+  document.getElementById("mini").className = waiting ? "warn" : "";
+
+  footEl.textContent = data.stamp
+    ? `每 ${data.intervalSec} 秒刷新 · 背景 ${Math.round(state.opacity * 100)}% · ${data.stamp}`
+    : "";
+
+  applyChrome();
+  refit();
+}
+
+function applyChrome() {
+  document.body.className = "mode-" + state.mode;
+  document.documentElement.style.setProperty("--bg-alpha", String(state.opacity));
+  document.getElementById("btnPin").classList.toggle("on", state.pinned);
+  document.getElementById("btnAlpha").classList.toggle("on", state.opacity < 1);
+}
+
+/* ------------------------------------------------------- 高度 / 宽度自测 */
+const CUSHION = 2;
+let fitting = false;
+let reported = { mode: "", w: 0, h: 0 };
+
+function measure() {
+  const htmlStyle = document.documentElement.style;
+  const bodyStyle = document.body.style;
+  const savedHtml = htmlStyle.height;
+  const savedBody = bodyStyle.height;
+  htmlStyle.height = "auto";
+  bodyStyle.height = "auto";
+  let height = 0;
+  try {
+    height = Math.ceil(Math.max(shell.getBoundingClientRect().height, shell.scrollHeight));
+  } finally {
+    htmlStyle.height = savedHtml;
+    bodyStyle.height = savedBody;
+  }
+  return height;
+}
+
+function fitWindow() {
+  if (fitting) return;
+  const bridge = api();
+  if (!bridge) return;
+  const width = WIDTHS[state.mode] || 400;
+  const height = measure();
+  if (height <= 0) return;
+  // report_size 会调整窗口，进而触发重排、改变下一次的测量值。
+  // 仅在结果真的变化时才上报，让这个循环收敛。
+  if (reported.mode === state.mode && reported.w === width && reported.h === height) return;
+  reported = { mode: state.mode, w: width, h: height };
+  fitting = true;
+  Promise.resolve(bridge.report_size(width, height + CUSHION))
+    .catch(() => {})
+    .then(() => { fitting = false; });
+}
+
+function refit() {
+  reported = { mode: "", w: 0, h: 0 };
+  requestAnimationFrame(() => requestAnimationFrame(fitWindow));
+}
+
+/* ---------------------------------------------------------------- 交互 */
+function setup() {
+  const bridge = api();
+  if (!bridge) return;
+
+  document.getElementById("btnClose").addEventListener("click", () => bridge.hide());
+  document.getElementById("btnRefresh").addEventListener("click", () => bridge.request_refresh());
+  document.getElementById("btnPin").addEventListener("click", () => {
+    state.pinned = !state.pinned;
+    applyChrome();
+    bridge.set_pinned(state.pinned).catch(() => {});
+  });
+  document.getElementById("btnMode").addEventListener("click", () => {
+    const next = MODES[(MODES.indexOf(state.mode) + 1) % MODES.length];
+    state.mode = next;
+    applyChrome();
+    refit();
+    bridge.set_mode(next).catch(() => {});
+  });
+  document.getElementById("btnAlpha").addEventListener("click", () => {
+    const index = OPACITIES.findIndex(v => Math.abs(v - state.opacity) < 0.01);
+    const next = OPACITIES[(index + 1) % OPACITIES.length];
+    state.opacity = next;
+    applyChrome();
+    bridge.set_opacity(next).catch(() => {});
+  });
+
+  // 整个标题栏都是拖动区，但不抢按钮的点击
+  document.getElementById("bar").addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target.closest(".btn")) return;
+    bridge.start_move().catch(() => {});
+  });
+
+  bridge.refresh().then(apply).catch(() => {});
+}
+
+window.addEventListener("cursorbridgeready", setup);
+// 后台轮询推送的新快照从这里进来
+window.cursorFloat = { apply };
+document.addEventListener("DOMContentLoaded", () => { applyChrome(); refit(); });
+</script>
+</body>
+</html>
