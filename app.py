@@ -34,6 +34,7 @@ from window_state import (
     WIDTHS,
     dock_side,
     demo_sessions,
+    edge_at,
     expanded_geometry,
     folded_geometry,
     group_sessions,
@@ -467,14 +468,24 @@ class CardWindow(QWebEngineView):
         return _screen_area(self.x(), self.y())
 
     def apply_dock(self, dock: bool) -> None:
-        """开关贴边：打开就吸附到最近的竖边，关闭就恢复成展开状态。"""
+        """开关贴边自动收起。
+
+        打开**不会**挪动窗口——贴边是位置驱动的：只有窗口真的被拖到边上时才收起，
+        放在屏幕中间就是普通浮窗，和以前一样。
+        """
         if not dock:
             if self.folded:
                 self.unfold()
             return
-        self.side = dock_side(self._area(), self.x(), self.width())
-        self._snap_to_edge()
+        side = self._at_edge()
+        if side:
+            self.side = side
+            self._snap_to_edge()
         self._left_at = None
+
+    def _at_edge(self) -> str | None:
+        """窗口离哪条竖边足够近，够近才返回它。"""
+        return edge_at(self._area(), self.x(), self.width())
 
     def _snap_to_edge(self) -> None:
         if self.folded:
@@ -489,11 +500,11 @@ class CardWindow(QWebEngineView):
             self.move(x, y)
 
     def fold(self) -> None:
-        """收起成贴边的细条。"""
+        """收起成贴边的细条。只应在窗口已经贴着边时调用。"""
         if self.folded:
             return
         area = self._area()
-        self.side = dock_side(area, self.x(), self.width())
+        self.side = self._at_edge() or dock_side(area, self.x(), self.width())
         self._expanded = (self.x(), self.y(), self.width(), self.height())
         hx, hy = folded_geometry(area, *self._expanded)
         self.folded = True
@@ -534,6 +545,13 @@ class CardWindow(QWebEngineView):
                 self.unfold()
             return
 
+        # 不在边上就完全是普通浮窗：不收起，也不吸附
+        side = self._at_edge()
+        if side is None:
+            self._left_at = None
+            return
+        self.side = side
+
         if rect.contains(pos):
             self._left_at = None
             return
@@ -560,7 +578,8 @@ class CardWindow(QWebEngineView):
         y = max(top, min(self.y(), bottom - target - 4))
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
-        if self._bridge._state.get("dock"):
+        # 内容变宽变窄时，只有本来就在边上才继续贴着，别把窗口拽过去
+        if self._bridge._state.get("dock") and self._at_edge():
             self._snap_to_edge()
 
     def set_on_top(self, pinned: bool) -> None:
@@ -576,10 +595,12 @@ class CardWindow(QWebEngineView):
             self._save_timer.start()
 
     def _on_move_settled(self) -> None:
-        """拖动停下后：贴边模式下吸回最近的竖边，并记住位置。"""
+        """拖动停下后：只有拖到了边上才吸附并进入贴边收起，否则保持自由摆放。"""
         if self._bridge._state.get("dock") and not self.folded:
-            self.side = dock_side(self._area(), self.x(), self.width())
-            self._snap_to_edge()
+            side = self._at_edge()
+            if side:
+                self.side = side
+                self._snap_to_edge()
         self._save_position()
 
     def closeEvent(self, event) -> None:               # noqa: N802 - Qt 覆写

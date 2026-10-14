@@ -68,7 +68,8 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(state["mode"], "detail")
         self.assertEqual(state["opacity"], 1.0)
         self.assertEqual(state["collapsed"], [])
-        self.assertFalse(state["dock"])
+        # 贴边收起默认开着：但它是位置驱动的，窗口在屏幕中间时行为不变
+        self.assertTrue(state["dock"])
 
     def test_round_trip(self):
         original = {"mode": "mini", "opacity": 0.4, "pinned": False,
@@ -76,8 +77,8 @@ class StateFileTest(unittest.TestCase):
         self.assertTrue(ws.save_state(original, self.path))
         self.assertEqual(ws.load_state(self.path), original)
 
-    def test_dock_defaults_to_false_when_absent(self):
-        self.path.write_text('{"mode": "detail"}', encoding="utf-8")
+    def test_dock_can_be_turned_off_and_stays_off(self):
+        self.path.write_text('{"mode": "detail", "dock": false}', encoding="utf-8")
         self.assertFalse(ws.load_state(self.path)["dock"])
 
     def test_corrupt_file_gives_defaults(self):
@@ -139,6 +140,17 @@ class DockingTest(unittest.TestCase):
         # 窗口中心正好在中线（960）左侧 -> 贴左；跨过中线 -> 贴右
         self.assertEqual(ws.dock_side(self.AREA, 700, 400), "left")
         self.assertEqual(ws.dock_side(self.AREA, 800, 400), "right")
+
+    def test_edge_at_only_reports_near_edges(self):
+        """贴边收起必须是位置驱动的：只有真的在边上才算。"""
+        self.assertEqual(ws.edge_at(self.AREA, 1920 - 400, 400), "right")   # 已贴右
+        self.assertEqual(ws.edge_at(self.AREA, 1880, 400), "right")         # 差 40 之内
+        self.assertEqual(ws.edge_at(self.AREA, 0, 400), "left")             # 已贴左
+        self.assertEqual(ws.edge_at(self.AREA, 20, 400), "left")            # 差 20
+        # 屏幕中间：不算贴边，行为应保持普通浮窗
+        self.assertIsNone(ws.edge_at(self.AREA, 500, 400))
+        self.assertIsNone(ws.edge_at(self.AREA, 960, 400))
+        self.assertIsNone(ws.edge_at(self.AREA, 1400, 400))
 
     def test_folded_sticks_to_the_edge_and_keeps_vertical_center(self):
         x, y = ws.folded_geometry(self.AREA, 1492, 300, 400, 144)

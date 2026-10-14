@@ -30,6 +30,9 @@ DEFAULT_WIDTH = WIDTHS["detail"]
 HANDLE_W = 22
 HANDLE_H = 76
 
+# 窗口边缘离屏幕边缘多近才算「在边上」
+SNAP_DIST = 24
+
 LOG = logging.getLogger("cursor-float")
 
 
@@ -63,7 +66,7 @@ def load_state(path: Path = STATE_PATH) -> dict:
     payload["mode"] = normalize_mode(payload.get("mode"))
     payload["opacity"] = normalize_opacity(payload.get("opacity"))
     payload["collapsed"] = normalize_collapsed(payload.get("collapsed"))
-    payload["dock"] = bool(payload.get("dock", False))
+    payload["dock"] = bool(payload.get("dock", True))
     return payload
 
 
@@ -104,6 +107,20 @@ def dock_side(area: tuple[int, int, int, int], x: int, width: int) -> str:
     """贴在左边缘还是右边缘——取更近的那一边。"""
     left, _top, right, _bottom = area
     return "right" if (x + width / 2) >= (left + right) / 2 else "left"
+
+
+def edge_at(area: tuple[int, int, int, int], x: int, width: int,
+            snap: int = SNAP_DIST) -> str | None:
+    """窗口离哪条竖边足够近就返回它，否则返回 None。
+
+    贴边收起是**位置驱动**的：只有窗口真的在边上才收起，在屏幕中间就是普通浮窗。
+    """
+    left, _top, right, _bottom = area
+    if x - left <= snap:
+        return "left"
+    if right - (x + width) <= snap:
+        return "right"
+    return None
 
 
 def folded_geometry(area: tuple[int, int, int, int], x: int, y: int,
