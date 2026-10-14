@@ -188,33 +188,45 @@ class DockingTest(unittest.TestCase):
             for y in (0, 60, 200, 500, 980):
                 expanded = (1520, y, 400, height)
                 hx, hy = ws.folded_geometry(self.AREA, *expanded)
-                left, top, right, bottom = ws.hot_zone(
+                x, top, w, h = ws.hot_zone(
                     (hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
-                self.assertLess(left, right, f"height={height} y={y} 热区为空")
-                self.assertLess(top, bottom, f"height={height} y={y} 热区为空")
-                self.assertGreaterEqual(left, expanded[0])
+                self.assertGreater(w, 0, f"height={height} y={y} 热区为空")
+                self.assertGreater(h, 0, f"height={height} y={y} 热区为空")
+                self.assertGreaterEqual(x, expanded[0])
                 self.assertGreaterEqual(top, expanded[1])
-                self.assertLessEqual(right, expanded[0] + expanded[2])
-                self.assertLessEqual(bottom, expanded[1] + expanded[3])
+                self.assertLessEqual(x + w, expanded[0] + expanded[2])
+                self.assertLessEqual(top + h, expanded[1] + expanded[3])
 
     def test_hot_zone_is_at_least_the_handle(self):
         expanded = (1520, 200, 400, 400)
         hx, hy = ws.folded_geometry(self.AREA, *expanded)
-        left, top, right, bottom = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
-        self.assertLessEqual(left, hx)
+        x, top, w, h = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
+        self.assertLessEqual(x, hx)
         self.assertLessEqual(top, hy)
-        self.assertGreaterEqual(right, hx + ws.HANDLE_W)
-        self.assertGreaterEqual(bottom, hy + ws.HANDLE_H)
+        self.assertGreaterEqual(x + w, hx + ws.HANDLE_W)
+        self.assertGreaterEqual(top + h, hy + ws.HANDLE_H)
+
+    def test_hot_zone_is_small_not_a_screen_wide_box(self):
+        """回归：按 (left, top, right, bottom) 构造 QRect 会得到 1920 宽的热区。"""
+        expanded = (1520, 200, 400, 111)
+        hx, hy = ws.folded_geometry(self.AREA, *expanded)
+        x, top, w, h = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
+        self.assertLessEqual(w, ws.HANDLE_W + 2 * 10)
+        self.assertLessEqual(h, ws.HANDLE_H + 2 * 10)
+        # 细条正下方 60px 处不该命中
+        self.assertGreater(top + h + 20, 0)
+        self.assertFalse(top <= hy + ws.HANDLE_H + 60 <= top + h,
+                         "细条下方 60px 不该落在热区里")
 
     def test_hot_zone_is_empty_when_handle_misses_the_card(self):
-        """细条和卡片完全不重叠时返回空框，调用方据此拒绝展开。
+        """细条和卡片完全不重叠时返回零尺寸，调用方据此拒绝展开。
 
         宁可要求点一下（点细条始终有效），也不要在那种情况下反复抖动。
         """
         hx, hy = ws.folded_geometry(self.AREA, 1492, 0, 400, 61)
-        left, top, right, bottom = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H),
-                                               (1492, 0, 400, 61))
-        self.assertGreaterEqual(left, right)
+        _x, _top, w, _h = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H),
+                                      (1492, 0, 400, 61))
+        self.assertEqual(w, 0)
 
 
 class GroupingTest(unittest.TestCase):

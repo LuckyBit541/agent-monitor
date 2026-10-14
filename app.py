@@ -514,7 +514,8 @@ class CardWindow(QWebEngineView):
         self._armed = False
         self._bridge.notify_fold()
         if DEBUG:
-            LOG.info("收起: 原=%s -> 细条=(%s,%s) side=%s", self._expanded, hx, hy, self.side)
+            zone = hot_zone((hx, hy, HANDLE_W, HANDLE_H), self._expanded, HOT_PAD)
+            LOG.info("收起: 原=%s -> 细条=(%s,%s) 热区=%s", self._expanded, hx, hy, zone)
 
     def hold_folded(self) -> None:
         """收起并停掉鼠标轮询——仅供截图使用。
@@ -557,6 +558,8 @@ class CardWindow(QWebEngineView):
                 self._armed = True          # 鼠标离开过，下次靠近才展开
             elif self._armed:
                 self._armed = False
+                if DEBUG:
+                    LOG.info("悬停展开: 鼠标=(%s,%s) 热区=%s", pos.x(), pos.y(), hot)
                 self.unfold()
             return
 

@@ -145,19 +145,23 @@ def expanded_geometry(area: tuple[int, int, int, int], x: int, y: int,
 
 def hot_zone(folded: tuple[int, int, int, int], expanded: tuple[int, int, int, int],
              pad: int = 10) -> tuple[int, int, int, int]:
-    """能触发展开的区域，并且被夹在「展开后的卡片」范围内。
+    """能触发展开的区域 (x, y, 宽, 高)，并且被夹在「展开后的卡片」范围内。
 
     细条会沿边缘方向放宽以方便命中，但绝不允许超出它将要展开成的那张卡片。
     一旦热区伸到卡片外面，指针落进去就会展开，而下一个轮询又发现指针在卡片外
     于是立刻收起——无限抖动。最简模式那种比细条高不了多少的矮卡片最容易撞上。
 
-    返回空框（right <= left 或 bottom <= top）表示完全没有重叠，调用方应当
-    视为「无法展开」。
+    返回宽或高 <= 0 时表示完全没有重叠，调用方应当视为「无法展开」。
+
+    注意返回的是宽高而不是右下角坐标：这里唯一的消费方是 Qt 的 QRect，而
+    QRect(x, y, w, h) 的第 3、4 个参数是宽高。曾经按左上角+右下角构造过一次，
+    结果热区变成了 1920x287 横跨大半屏幕，鼠标还没靠近就展开。
     """
     fx, fy, fw, fh = folded
     ex, ey, ew, eh = expanded
-    return (max(fx, ex), max(fy - pad, ey),
-            min(fx + fw, ex + ew), min(fy + fh + pad, ey + eh))
+    x1, y1 = max(fx, ex), max(fy - pad, ey)
+    x2, y2 = min(fx + fw, ex + ew), min(fy + fh + pad, ey + eh)
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
 
 
 def group_sessions(sessions: Sequence[Any], collapsed: Iterable[str]) -> list[dict]:
