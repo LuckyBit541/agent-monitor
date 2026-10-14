@@ -26,9 +26,10 @@ MIN_HEIGHT = 44
 MAX_HEIGHT = 1400
 DEFAULT_WIDTH = WIDTHS["detail"]
 
-# 贴边收起后的细条尺寸
+# 贴边收起后的细条尺寸。高度贴着「圆点 + 会话数」两行内容，
+# 再高就只是把数字吊在一大片空白中间。
 HANDLE_W = 22
-HANDLE_H = 76
+HANDLE_H = 44
 
 # 窗口边缘离屏幕边缘多近才算「在边上」
 SNAP_DIST = 24
@@ -140,6 +141,23 @@ def expanded_geometry(area: tuple[int, int, int, int], x: int, y: int,
     ex = left if dock_side(area, x, HANDLE_W) == "left" else area[2] - width
     ey = max(top, min(y + HANDLE_H // 2 - height // 2, bottom - height - 4))
     return ex, ey
+
+
+def hot_zone(folded: tuple[int, int, int, int], expanded: tuple[int, int, int, int],
+             pad: int = 10) -> tuple[int, int, int, int]:
+    """能触发展开的区域，并且被夹在「展开后的卡片」范围内。
+
+    细条会沿边缘方向放宽以方便命中，但绝不允许超出它将要展开成的那张卡片。
+    一旦热区伸到卡片外面，指针落进去就会展开，而下一个轮询又发现指针在卡片外
+    于是立刻收起——无限抖动。最简模式那种比细条高不了多少的矮卡片最容易撞上。
+
+    返回空框（right <= left 或 bottom <= top）表示完全没有重叠，调用方应当
+    视为「无法展开」。
+    """
+    fx, fy, fw, fh = folded
+    ex, ey, ew, eh = expanded
+    return (max(fx, ex), max(fy - pad, ey),
+            min(fx + fw, ex + ew), min(fy + fh + pad, ey + eh))
 
 
 def group_sessions(sessions: Sequence[Any], collapsed: Iterable[str]) -> list[dict]:

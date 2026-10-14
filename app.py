@@ -38,6 +38,7 @@ from window_state import (
     expanded_geometry,
     folded_geometry,
     group_sessions,
+    hot_zone,
     initial_position,
     load_state,
     normalize_mode,
@@ -74,7 +75,7 @@ def _fail(message: str) -> None:
 
 
 try:
-    from PySide6.QtCore import QFile, QIODevice, QObject, QPoint, Qt, QTimer, QUrl, Signal, Slot
+    from PySide6.QtCore import QFile, QIODevice, QObject, QPoint, QRect, Qt, QTimer, QUrl, Signal, Slot
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWebChannel import QWebChannel
     from PySide6.QtWebEngineCore import QWebEngineScript
@@ -537,8 +538,14 @@ class CardWindow(QWebEngineView):
         pos = QCursor.pos()
         rect = self.frameGeometry()
         if self.folded:
-            hot = rect.adjusted(-HOT_PAD, -HOT_PAD, HOT_PAD, HOT_PAD)
-            if not hot.contains(pos):
+            # 热区只沿边缘方向放宽，并且不超出展开后那张卡片的范围。
+            # 一旦热区伸到卡片之外，指针落进那条缝就会「展开→收起→展开」
+            # 无限抖动——矮卡片（最简模式）特别容易撞上。
+            hot = None
+            if self._expanded:
+                hx, hy = folded_geometry(self._area(), *self._expanded)
+                hot = QRect(*hot_zone((hx, hy, HANDLE_W, HANDLE_H), self._expanded, HOT_PAD))
+            if hot is None or hot.isEmpty() or not hot.contains(pos):
                 self._armed = True          # 鼠标离开过，下次靠近才展开
             elif self._armed:
                 self._armed = False

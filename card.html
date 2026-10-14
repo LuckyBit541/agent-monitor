@@ -200,7 +200,7 @@
   /* 收起时窗口本身就被缩成 22x76 并吸附到屏幕边，这里只负责长成一条细杆。 */
   body.dock-folded { --w: 22px; }
   body.dock-folded #shell {
-    height: 76px;
+    height: 44px;
     border-radius: 9px 0 0 9px;
     display: flex;
     align-items: center;
@@ -229,10 +229,6 @@
     font-size: 15px; font-weight: 700; color: var(--txt);
     font-family: Consolas, monospace; line-height: 1;
   }
-  #handle .hbar {
-    width: 3px; height: 22px; border-radius: 2px;
-    background: rgba(255, 255, 255, .22);
-  }
 
   body.mode-detail #mini, body.mode-compact #mini { display: none; }
 </style>
@@ -254,7 +250,6 @@
   <div id="handle" title="点击展开">
     <span class="hdot"></span>
     <span class="hnum" id="handleNum">0</span>
-    <span class="hbar"></span>
   </div>
 
   <div id="content">

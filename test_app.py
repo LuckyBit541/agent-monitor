@@ -178,6 +178,44 @@ class DockingTest(unittest.TestCase):
         _x, y2 = ws.expanded_geometry(self.AREA, 1900, 0, 400, 400)
         self.assertGreaterEqual(y2, 0)
 
+    def test_hot_zone_never_escapes_the_open_card(self):
+        """热区伸到卡片外就会展开/收起无限抖动，矮卡片最容易撞上。
+
+        贴到右边缘时卡片右边缘就是屏幕右边缘（1920-400=1520），细条也贴着它，
+        所以两者一定有重叠。
+        """
+        for height in (61, 122, 177, 300, 400, 900):
+            for y in (0, 60, 200, 500, 980):
+                expanded = (1520, y, 400, height)
+                hx, hy = ws.folded_geometry(self.AREA, *expanded)
+                left, top, right, bottom = ws.hot_zone(
+                    (hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
+                self.assertLess(left, right, f"height={height} y={y} 热区为空")
+                self.assertLess(top, bottom, f"height={height} y={y} 热区为空")
+                self.assertGreaterEqual(left, expanded[0])
+                self.assertGreaterEqual(top, expanded[1])
+                self.assertLessEqual(right, expanded[0] + expanded[2])
+                self.assertLessEqual(bottom, expanded[1] + expanded[3])
+
+    def test_hot_zone_is_at_least_the_handle(self):
+        expanded = (1520, 200, 400, 400)
+        hx, hy = ws.folded_geometry(self.AREA, *expanded)
+        left, top, right, bottom = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H), expanded)
+        self.assertLessEqual(left, hx)
+        self.assertLessEqual(top, hy)
+        self.assertGreaterEqual(right, hx + ws.HANDLE_W)
+        self.assertGreaterEqual(bottom, hy + ws.HANDLE_H)
+
+    def test_hot_zone_is_empty_when_handle_misses_the_card(self):
+        """细条和卡片完全不重叠时返回空框，调用方据此拒绝展开。
+
+        宁可要求点一下（点细条始终有效），也不要在那种情况下反复抖动。
+        """
+        hx, hy = ws.folded_geometry(self.AREA, 1492, 0, 400, 61)
+        left, top, right, bottom = ws.hot_zone((hx, hy, ws.HANDLE_W, ws.HANDLE_H),
+                                               (1492, 0, 400, 61))
+        self.assertGreaterEqual(left, right)
+
 
 class GroupingTest(unittest.TestCase):
     def test_groups_ordered_by_recent_activity(self):
