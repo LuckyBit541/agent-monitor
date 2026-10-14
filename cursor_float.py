@@ -702,6 +702,7 @@ class FloatWindow:
         tk = self.tk
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="立即刷新", command=self._poll_now)
+        m.add_command(label="移回右上角", command=self._reset_position)
         if self.collapsed:
             m.add_command(label="展开全部项目", command=self._expand_all)
         projects = {s.project for s in self.sessions}
@@ -719,6 +720,12 @@ class FloatWindow:
     def _expand_all(self) -> None:
         self.collapsed.clear()
         self._render()
+        self._save_geometry()
+
+    def _reset_position(self) -> None:
+        """把窗口放回屏幕右上角——拖到屏幕外之后靠这个找回来。"""
+        sw = self.root.winfo_screenwidth()
+        self.root.geometry(f"+{sw - int(self.cfg['width']) - 28}+48")
         self._save_geometry()
 
     def _collapse_all(self) -> None:
@@ -768,7 +775,19 @@ class FloatWindow:
         if not self._drag:
             return
         x0, y0, wx, wy = self._drag
-        self.root.geometry(f"+{wx + e.x_root - x0}+{wy + e.y_root - y0}")
+        x, y = wx + e.x_root - x0, wy + e.y_root - y0
+        # 拖动时就夹住，避免把窗口拖出屏幕后彻底找不回来
+        x, y = self._clamp(x, y)
+        self.root.geometry(f"+{x}+{y}")
+
+    def _clamp(self, x: int, y: int, h: Optional[int] = None) -> tuple[int, int]:
+        """把窗口左上角夹到可视区域内（用真实高度，而不是猜一个值）。"""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = int(self.cfg["width"])
+        if h is None:
+            h = max(self.root.winfo_height(), 1)
+        return max(0, min(x, max(0, sw - w))), max(0, min(y, max(0, sh - h - 4)))
 
     def _drag_end(self, _e) -> None:
         self._drag = None
@@ -777,7 +796,8 @@ class FloatWindow:
     # -- 位置与折叠状态记忆 -------------------------------------------------
     def _restore_geometry(self) -> None:
         sw = self.root.winfo_screenwidth()
-        x, y = sw - int(self.cfg["width"]) - 28, 60
+        w = int(self.cfg["width"])
+        x, y = sw - w - 28, 60
         if STATE_PATH.exists():
             try:
                 st = json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -785,9 +805,10 @@ class FloatWindow:
                 self.collapsed = {str(p) for p in st.get("collapsed", [])}
             except Exception:
                 pass
-        x = max(0, min(x, sw - 120))
-        y = max(0, y)
-        self.root.geometry(f"{int(self.cfg['width'])}x140+{x}+{y}")
+        # 边界约束：窗口一旦被拖出屏幕就再也看不见了（实测发生过），
+        # 所以按真实高度把整个窗口夹回可视区域；渲染后再夹一次。
+        x, y = self._clamp(x, y, 140)
+        self.root.geometry(f"{w}x140+{x}+{y}")
 
     def _save_geometry(self) -> None:
         try:
@@ -927,7 +948,9 @@ class FloatWindow:
         self.body.place_configure(width=int(self.cfg["width"]) - 2 * self.radius)
         self.root.update_idletasks()
         h = self.body.winfo_reqheight() + 2 * self.radius
-        self.root.geometry(f"{int(self.cfg['width'])}x{h}")
+        # 高度会随会话数变化，重新夹一次位置，保证窗口整体留在屏幕内
+        x, y = self._clamp(self.root.winfo_x(), self.root.winfo_y(), h)
+        self.root.geometry(f"{int(self.cfg['width'])}x{h}+{x}+{y}")
         self._redraw_bg()
 
     def _render_group_header(self, project: str, items: list[Session],
