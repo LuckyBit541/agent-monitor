@@ -213,6 +213,7 @@ python tools\capture.py
 | `test_sessions.py` / `test_app.py` | 单元测试 |
 | `tools/capture.py` | 生成 `_preview.png` 的开发脚本 |
 | `启动悬浮窗.bat` | 双击启动（自动检查/安装依赖） |
+| `cursor-float.ico` | 桌面快捷方式用的图标（会话列表造型） |
 | `requirements.txt` | PySide6；Pillow 仅截图时需要 |
 
 ## 已知限制
