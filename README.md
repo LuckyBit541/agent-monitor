@@ -12,6 +12,8 @@
 
 双击 `启动悬浮窗.bat`。脚本会找一个带 PySide6 的 Python，缺失时自动 `pip install`（首次需要联网，PySide6 约几百 MB）。
 
+想放到桌面：右键 `启动悬浮窗.bat` → **发送到** → **桌面快捷方式**，再把快捷方式的图标改成同目录的 `cursor-float.ico`。
+
 手动启动：
 
 ```powershell

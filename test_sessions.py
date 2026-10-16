@@ -113,7 +113,7 @@ class DetectionTest(unittest.TestCase):
     def test_generating_with_stale_aborted_status_is_detected(self):
         """status='aborted' + 空 generatingBubbleIds + 冻住的头部时间戳，
         只要 composerData 的内容在变，就必须认出来。"""
-        ws = {"$mid": 1, "fsPath": r"d:\workspace\cursor\test"}
+        ws = {"$mid": 1, "fsPath": r"c:\work\project-alpha"}
         self.put("live", "长任务示例", updated=NOW - 200_000, path=ws,
                  cdata=composer("live", status="aborted", generating=[], last_bubble="b1"),
                  bub=bubble())
